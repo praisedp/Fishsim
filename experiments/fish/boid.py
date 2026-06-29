@@ -14,6 +14,7 @@ from __future__ import annotations
 from pygame.math import Vector2
 
 from config import Config
+from genome import Genome
 
 
 def _limit(vec: Vector2, max_len: float) -> Vector2:
@@ -23,23 +24,30 @@ def _limit(vec: Vector2, max_len: float) -> Vector2:
     return vec
 
 
-def _steer_towards(desired: Vector2, velocity: Vector2, cfg: Config) -> Vector2:
-    """Reynolds steering: aim at ``desired`` (scaled to max_speed), clamp force."""
+def _steer_towards(
+    desired: Vector2, velocity: Vector2, max_speed: float, cfg: Config
+) -> Vector2:
+    """Reynolds steering: aim at ``desired`` (scaled to max_speed), clamp force.
+
+    ``max_speed`` is per-fish (from its genome); ``max_force`` stays global.
+    """
     if desired.length_squared() == 0:
         return Vector2(0, 0)
-    desired = desired.normalize() * cfg.max_speed
+    desired = desired.normalize() * max_speed
     return _limit(desired - velocity, cfg.max_force)
 
 
 class Boid:
-    """A single fish: position + velocity is all the state it needs."""
+    """A single fish. Its behaviour is fully determined by its ``genome``."""
 
-    __slots__ = ("pos", "vel", "accel")
+    __slots__ = ("pos", "vel", "accel", "genome", "age")
 
-    def __init__(self, pos: Vector2, vel: Vector2):
+    def __init__(self, pos: Vector2, vel: Vector2, genome: Genome):
         self.pos = pos
         self.vel = vel
         self.accel = Vector2(0, 0)  # scratch for the two-pass update
+        self.genome = genome
+        self.age = 0  # ticks lived; drives reproduction maturity
 
     # --- The three classic rules -------------------------------------------
 
@@ -57,7 +65,7 @@ class Boid:
         if count == 0:
             return Vector2(0, 0)
         steer /= count
-        return _steer_towards(steer, self.vel, cfg)
+        return _steer_towards(steer, self.vel, self.genome.max_speed, cfg)
 
     def alignment(self, neighbours: list["Boid"], cfg: Config) -> Vector2:
         """Steer toward the average heading of neighbours."""
@@ -69,7 +77,7 @@ class Boid:
         if count == 0:
             return Vector2(0, 0)
         avg_vel /= count
-        return _steer_towards(avg_vel, self.vel, cfg)
+        return _steer_towards(avg_vel, self.vel, self.genome.max_speed, cfg)
 
     def cohesion(self, neighbours: list["Boid"], cfg: Config) -> Vector2:
         """Steer toward the local centre of mass."""
@@ -81,37 +89,54 @@ class Boid:
         if count == 0:
             return Vector2(0, 0)
         center /= count
-        return _steer_towards(center - self.pos, self.vel, cfg)
+        return _steer_towards(center - self.pos, self.vel, self.genome.max_speed, cfg)
 
     # --- Predator avoidance -------------------------------------------------
 
-    def flee(self, shark_pos: Vector2, cfg: Config) -> Vector2:
-        """Flee the shark when it's within ``flee_radius`` — stronger up close."""
+    def flee(self, shark_pos: Vector2 | None, cfg: Config) -> Vector2:
+        """Flee the nearest shark when within range — stronger up close.
+
+        The trigger range is the base ``flee_radius`` scaled by the fish's ``fear``
+        gene, so timid fish bolt early and bold fish hold their nerve. ``shark_pos``
+        is ``None`` when no sharks are left alive, in which case there's nothing to
+        flee.
+        """
+        if shark_pos is None:
+            return Vector2(0, 0)
+        radius = cfg.flee_radius * self.genome.fear
         offset = self.pos - shark_pos
         dist_sq = offset.length_squared()
-        if dist_sq == 0 or dist_sq > cfg.flee_radius * cfg.flee_radius:
+        if dist_sq == 0 or dist_sq > radius * radius:
             return Vector2(0, 0)
         dist = dist_sq ** 0.5
         # Closer shark -> larger desired magnitude before steering normalises it.
         desired = offset.normalize() / dist
-        return _steer_towards(desired, self.vel, cfg)
+        return _steer_towards(desired, self.vel, self.genome.max_speed, cfg)
 
     # --- Combine ------------------------------------------------------------
 
-    def compute(self, neighbours: list["Boid"], shark_pos: Vector2, cfg: Config) -> None:
-        """Read-only pass: accumulate steering into ``self.accel`` (don't apply)."""
+    def compute(
+        self, neighbours: list["Boid"], shark_pos: Vector2 | None, cfg: Config
+    ) -> None:
+        """Read-only pass: accumulate steering into ``self.accel`` (don't apply).
+
+        The four rule weights now come from this fish's genome, not the config.
+        ``shark_pos`` is the nearest shark (or ``None`` if none are alive).
+        """
+        g = self.genome
         self.accel = (
-            cfg.w_sep * self.separation(neighbours, cfg)
-            + cfg.w_ali * self.alignment(neighbours, cfg)
-            + cfg.w_coh * self.cohesion(neighbours, cfg)
-            + cfg.w_flee * self.flee(shark_pos, cfg)
+            g.w_sep * self.separation(neighbours, cfg)
+            + g.w_ali * self.alignment(neighbours, cfg)
+            + g.w_coh * self.cohesion(neighbours, cfg)
+            + g.w_flee * self.flee(shark_pos, cfg)
         )
 
     def apply(self, cfg: Config) -> None:
-        """Write pass: integrate velocity (speed-clamped) then position."""
-        self.vel = _limit(self.vel + self.accel, cfg.max_speed)
+        """Write pass: integrate velocity (speed-clamped) then position; age one tick."""
+        self.vel = _limit(self.vel + self.accel, self.genome.max_speed)
         # Keep a minimum speed so isolated fish keep drifting instead of freezing.
         speed_sq = self.vel.length_squared()
         if 0 < speed_sq < cfg.min_speed * cfg.min_speed:
             self.vel = self.vel.normalize() * cfg.min_speed
         self.pos = self.pos + self.vel
+        self.age += 1

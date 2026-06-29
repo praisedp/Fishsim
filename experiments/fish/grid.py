@@ -10,6 +10,8 @@ no incremental bookkeeping to get wrong.
 
 from __future__ import annotations
 
+import math
+
 from boid import Boid
 
 
@@ -40,5 +42,28 @@ class SpatialGrid:
                     if other is boid:
                         continue
                     if boid.pos.distance_squared_to(other.pos) <= radius_sq:
+                        found.append(other)
+        return found
+
+    def neighbours_at(self, x: float, y: float, radius: float) -> list[Boid]:
+        """All fish within ``radius`` of a raw point ``(x, y)``.
+
+        Unlike :meth:`neighbours`, ``radius`` may be larger than the cell size (a
+        shark sees much further than a fish), so we scan enough cell-rings to cover
+        it instead of assuming the 3x3 neighbourhood is sufficient.
+        """
+        col, row = self._key(x, y)
+        reach = int(math.ceil(radius / self.cell_size))
+        radius_sq = radius * radius
+        found: list[Boid] = []
+        for dc in range(-reach, reach + 1):
+            for dr in range(-reach, reach + 1):
+                bucket = self.cells.get((col + dc, row + dr))
+                if not bucket:
+                    continue
+                for other in bucket:
+                    dx = other.pos.x - x
+                    dy = other.pos.y - y
+                    if dx * dx + dy * dy <= radius_sq:
                         found.append(other)
         return found
