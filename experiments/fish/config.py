@@ -16,9 +16,9 @@ class Config:
     # --- World ---
     width: int = 1400
     height: int = 800
-    fps: int = 60
+    fps: int = 45
     num_fish: int = 440  # starting fish population
-    num_sharks: int = 10  # starting shark population
+    num_sharks: int = 0  # starting shark population
     wrap_edges: bool = True  # True = toroidal wrap-around, False = soft bounce
 
     # --- Shared physics (NOT per-animal) ---
@@ -38,11 +38,11 @@ class Config:
     max_pop: int = 600  # hard cap on living fish (no floor: true ecosystem)
 
     # --- Shark genetic algorithm (energy / hunger driven) ---
-    max_sharks: int = 25  # hard cap on living sharks (no floor: they can go extinct)
+    max_sharks: int = 30  # hard cap on living sharks (no floor: they can go extinct)
     shark_start_energy: float = 120.0  # energy a fresh/immigrant shark begins with
-    shark_energy_per_fish: float = 9.5  # energy gained per fish eaten
-    shark_repro_energy: float = 160.0  # energy needed to spawn a child
-    shark_birth_cost: float = 50.0  # energy lost from the split at birth
+    shark_energy_per_fish: float = 9.0  # energy gained per fish eaten
+    shark_repro_energy: float = 250.0  # energy needed to spawn a child
+    shark_birth_cost: float = 500.0  # energy lost from the split at birth
     shark_metab_base: float = 0.05  # baseline energy burned per tick
     shark_metab_speed_k: float = 0.020  # extra burn per unit of max_speed gene
     shark_metab_perc_k: float = 0.0006  # extra burn per unit of perception gene
@@ -56,6 +56,17 @@ class Config:
     # --- Edge handling (soft-bounce mode only) ---
     edge_margin: float = 80.0
     edge_turn: float = 0.3
+
+    # --- Wall obstacles (static geometric shards; both species soft-bounce) ---
+    walls_enabled: bool = (
+        False  # True = shards scatter across the sea, False = no walls
+    )
+    num_walls: int = 28  # how many shards scatter across the sea
+    wall_min_radius: float = 22.0  # smallest shard size
+    wall_max_radius: float = 50.0  # largest shard size
+    wall_margin: float = 26.0  # soft-bounce band; > max speed (5–6) so no tunneling
+    wall_push: float = 0.5  # velocity-nudge strength near a wall face
+    wall_border_margin: float = 60.0  # keep shards off the screen edges
 
     @property
     def cell_size(self) -> float:

@@ -10,6 +10,7 @@ Controls:
   - M: toggle MANUAL shark — the mouse drives the nearest shark; others stay auto.
   - C: cycle which gene the FISH colour maps to.
   - K: cycle which gene the SHARK colour maps to.
+  - O: toggle the geometric wall obstacles (re-scatters a fresh layout when on).
   - R: reset / reseed the world (handy if a species has gone extinct).
   - W: toggle wrap-around vs soft-bounce edges.
   - Space: pause/resume.   Esc / window close: quit.
@@ -28,6 +29,8 @@ from sim import Simulation
 OCEAN = (12, 28, 54)
 KILL_RING = (220, 70, 70, 60)
 HUD = (180, 200, 220)
+WALL = (110, 118, 126)  # muted stony grey
+WALL_EDGE = (70, 76, 82)  # darker facet outline
 
 
 def fish_color(fraction: float) -> pygame.Color:
@@ -49,6 +52,17 @@ def shark_color(fraction: float, energy_frac: float) -> pygame.Color:
 
 def _clamp01(x: float) -> float:
     return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+
+def draw_walls(surface: pygame.Surface, walls) -> None:
+    """Fill each shard as a flat grey polygon with a slightly darker facet outline."""
+    for shard in walls.shards:
+        verts = [(v.x, v.y) for v in shard.verts]
+        # Deterministic per-shard shade so facets read distinctly without flicker.
+        jitter = int(shard.centroid.x + shard.centroid.y) % 24 - 12
+        shade = tuple(max(0, min(255, c + jitter)) for c in WALL)
+        pygame.draw.polygon(surface, shade, verts)
+        pygame.draw.polygon(surface, WALL_EDGE, verts, 1)
 
 
 def draw_fish(surface: pygame.Surface, boid, color: pygame.Color) -> None:
@@ -114,6 +128,9 @@ def main() -> None:
                     fish_gene_idx = (fish_gene_idx + 1) % len(GENE_NAMES)
                 elif event.key == pygame.K_k:
                     shark_gene_idx = (shark_gene_idx + 1) % len(SHARK_GENE_NAMES)
+                elif event.key == pygame.K_o:
+                    cfg.walls_enabled = not cfg.walls_enabled
+                    sim.walls = sim._build_walls()  # (re)scatter or clear shards
                 elif event.key == pygame.K_r:
                     sim = Simulation(cfg)
 
@@ -128,6 +145,8 @@ def main() -> None:
         screen.fill(OCEAN)
         overlay = pygame.Surface((cfg.width, cfg.height), pygame.SRCALPHA)
 
+        if cfg.walls_enabled:
+            draw_walls(screen, sim.walls)
         for f in sim.fish:
             draw_fish(screen, f, fish_color(f.genome.gene_fraction(fish_gene)))
         for s in sim.sharks:
@@ -162,7 +181,7 @@ def _draw_hud(screen, font, sim, cfg, clock, manual, fish_gene, shark_gene) -> N
     status_line = (
         f"fps:{clock.get_fps():3.0f}  shark:{mode}  edges:{edges}   "
         f"fish=[{fish_gene}] shark=[{shark_gene}]   "
-        f"[M]shark [C]fishcol [K]sharkcol [R]reset [W]edges [Space]pause"
+        f"[M]shark [C]fishcol [K]sharkcol [O]walls [R]reset [W]edges [Space]pause"
     )
 
     for i, text in enumerate((fish_line, shark_line, status_line)):

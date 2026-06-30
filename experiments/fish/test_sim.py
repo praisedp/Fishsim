@@ -20,6 +20,7 @@ from genome import (
 )
 from grid import SpatialGrid
 from sim import Shark, Simulation
+from walls import Shard, WallField, avoid
 
 
 def _genome(**overrides) -> Genome:
@@ -243,6 +244,71 @@ def test_ecosystem_runs_within_invariants():
         sim.step()  # fully autonomous
         assert 0 <= len(sim.fish) <= cfg.max_pop
         assert 0 <= len(sim.sharks) <= cfg.max_sharks
+
+
+# --- Wall obstacles ---------------------------------------------------------
+
+
+def _square_shard(cx: float, cy: float, half: float = 30.0) -> Shard:
+    """An axis-aligned square shard centred at (cx, cy)."""
+    return Shard([
+        Vector2(cx - half, cy - half),
+        Vector2(cx + half, cy - half),
+        Vector2(cx + half, cy + half),
+        Vector2(cx - half, cy + half),
+    ])
+
+
+def test_wall_avoidance_pushes_outward():
+    shard = _square_shard(200, 200, half=30.0)
+    # A point dead-centre inside is ejected and pushed away from the wall.
+    push, eject = avoid(Vector2(200, 200), [shard], margin=26.0)
+    assert eject is not None and eject.length() > 0
+    # A point just left of the left face is shoved further left (outward).
+    push, eject = avoid(Vector2(165, 200), [shard], margin=26.0)
+    assert push.x < 0
+    assert eject is None  # outside, no ejection
+    # A point well clear of every shard feels nothing.
+    push, eject = avoid(Vector2(500, 500), [shard], margin=26.0)
+    assert push.length() == 0 and eject is None
+
+
+def test_wall_index_finds_shard():
+    cfg = Config()
+    field = WallField([_square_shard(200, 200, half=30.0)], cfg.cell_size, cfg.wall_margin)
+    assert len(field.nearby(200, 200)) == 1  # point over the shard
+    assert len(field.nearby(1000, 700)) == 0  # far away cell
+
+
+def test_fish_does_not_penetrate_wall():
+    cfg = Config(num_fish=0, num_sharks=0, walls_enabled=False, width=600, height=400)
+    sim = Simulation(cfg, seed=1)
+    shard = _square_shard(300, 200, half=30.0)
+    sim.walls = WallField([shard], cfg.cell_size, cfg.wall_margin)
+    cfg.walls_enabled = True
+    # A fish to the left, driving straight at the shard at top speed.
+    f = _boid(Vector2(220, 200), Vector2(5, 0), max_speed=5.0)
+    sim.fish = [f]
+    for _ in range(60):
+        sim.step()
+        # Signed distance to the nearest face: >0 outside, <0 inside. Never let the
+        # fish end a tick more than a hair inside the shard.
+        depth = max((f.pos - a).dot(n) for a, _b, n in shard.edges)
+        assert depth > -2.0, (f.pos, depth)
+        assert f.pos.x == f.pos.x  # not NaN
+
+
+def test_ecosystem_runs_with_walls():
+    cfg = Config(num_fish=60, num_sharks=5, width=600, height=400, walls_enabled=True)
+    sim = Simulation(cfg, seed=5)
+    assert len(sim.walls.shards) == cfg.num_walls
+    for _ in range(300):
+        sim.step()
+        assert 0 <= len(sim.fish) <= cfg.max_pop
+        assert 0 <= len(sim.sharks) <= cfg.max_sharks
+    for f in sim.fish:
+        assert f.pos.x == f.pos.x and f.pos.y == f.pos.y  # not NaN
+        assert f.vel.length() <= f.genome.max_speed + 1e-6
 
 
 if __name__ == "__main__":

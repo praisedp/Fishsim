@@ -26,7 +26,7 @@ import random
 
 from pygame.math import Vector2
 
-from boid import Boid
+from boid import Boid, _limit
 from config import Config
 from genome import (
     GENE_NAMES,
@@ -35,6 +35,7 @@ from genome import (
     SharkGenome,
 )
 from grid import SpatialGrid
+from walls import WallField, avoid
 
 
 class Shark:
@@ -66,6 +67,8 @@ class Simulation:
         self.cfg = cfg
         self.grid = SpatialGrid(cfg.cell_size)
         self.rng = random.Random(seed)
+        # Static obstacles, built once (they never move) — seeded for reproducibility.
+        self.walls = self._build_walls()
         self.fish: list[Boid] = [self._random_fish() for _ in range(cfg.num_fish)]
         self.sharks: list[Shark] = [
             self._random_shark() for _ in range(cfg.num_sharks)
@@ -78,6 +81,15 @@ class Simulation:
         self.shark_deaths = 0
         self.stats: dict[str, float] = {}
         self._update_stats()
+
+    # --- Walls --------------------------------------------------------------
+
+    def _build_walls(self) -> WallField:
+        """A scatter of static shards, or an empty field when walls are off."""
+        cfg = self.cfg
+        if cfg.walls_enabled:
+            return WallField.scatter(cfg, self.rng)
+        return WallField([], cfg.cell_size, cfg.wall_margin)
 
     # --- Spawning -----------------------------------------------------------
 
@@ -124,6 +136,7 @@ class Simulation:
             target = manual_target if s is manual_shark else self._shark_target(s)
             s.update(target, cfg)
             self._wrap_shark(s)
+            self._handle_walls(s, is_shark=True)
 
         # Pass 1 — fish compute (read-only): flock + flee the nearest shark.
         for f in self.fish:
@@ -133,6 +146,7 @@ class Simulation:
         # Pass 2 — fish apply (write): integrate, then resolve world edges.
         for f in self.fish:
             f.apply(cfg)
+            self._handle_walls(f, is_shark=False)
             self._handle_edges(f)
 
         # Genetic algorithm: predation feeds sharks, then births and deaths.
@@ -308,6 +322,29 @@ class Simulation:
             if s.pos.y < 0 or s.pos.y > cfg.height:
                 s.vel.y = -s.vel.y
                 s.pos.y = max(0.0, min(float(cfg.height), s.pos.y))
+
+    def _handle_walls(self, entity, is_shark: bool) -> None:
+        """Soft-bounce an entity off any nearby shard.
+
+        A velocity nudge along the outward wall normal (stronger up close) steers fish
+        and sharks around obstacles; if one has crossed *inside* a shard, an extra
+        positional ejection lifts it back out. Sharks need that ejection because
+        :meth:`Shark.update` rewrites their velocity from scratch each tick, so a nudge
+        alone would be forgotten — they end up sliding along a wall instead.
+        """
+        cfg = self.cfg
+        if not cfg.walls_enabled:
+            return
+        push, eject = avoid(
+            entity.pos, self.walls.nearby(entity.pos.x, entity.pos.y), cfg.wall_margin
+        )
+        if eject is not None:
+            entity.pos = entity.pos + eject
+        if push.length_squared() > 0:
+            entity.vel = entity.vel + push * cfg.wall_push
+            if not is_shark:
+                # Keep the per-fish speed cap intact (the nudge isn't otherwise clamped).
+                entity.vel = _limit(entity.vel, entity.genome.max_speed)
 
     def _handle_edges(self, f: Boid) -> None:
         cfg = self.cfg
