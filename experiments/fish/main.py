@@ -18,11 +18,11 @@ Controls:
 
 from __future__ import annotations
 
+import numpy as np
 import pygame
-from pygame.math import Vector2
 
 from config import Config
-from genome import GENE_NAMES, SHARK_GENE_NAMES
+from genome import FISH_SPEC, GENE_NAMES, SHARK_GENE_NAMES, SHARK_SPEC, gene_fractions
 from sim import Simulation
 
 # Colours
@@ -31,27 +31,51 @@ KILL_RING = (220, 70, 70, 60)
 HUD = (180, 200, 220)
 WALL = (110, 118, 126)  # muted stony grey
 WALL_EDGE = (70, 76, 82)  # darker facet outline
+HUE_BLUE = 210.0  # base hue of both palettes (blue)
+
+# Body geometry, in pixels along/across the heading.
+FISH_NOSE = 7.0
+FISH_TAIL = 4.0
+FISH_HALF_W = 3.0
+SHARK_NOSE = 14.0  # long front point
+SHARK_CROSS_FWD = 2.0  # crossbar sits this far forward of centre
+SHARK_HALF_W = 6.0
+SHARK_TAIL = 8.0  # back point
+SHARK_BACK_SHADE = 0.25  # darker back triangle for depth
+
+# HUD layout
+HUD_X = 10
+HUD_Y = 10
+HUD_LINE_H = 18
+
+# Fish colours only depend on a 0–1 gene fraction, so a small precomputed ramp
+# replaces a per-fish-per-frame Color.hsva construction.
+COLOR_LUT_SIZE = 64
 
 
 def fish_color(fraction: float) -> pygame.Color:
     """Map a 0–1 fish-gene fraction to a hue: low = calm blue, high = bold red."""
     color = pygame.Color(0)
-    hue = 210.0 * (1.0 - _clamp01(fraction))  # 210=blue -> 0=red
-    color.hsva = (hue, 85, 100, 100)
+    color.hsva = (HUE_BLUE * (1.0 - fraction), 85, 100, 100)
     return color
+
+
+FISH_COLOR_LUT = [fish_color(k / (COLOR_LUT_SIZE - 1)) for k in range(COLOR_LUT_SIZE)]
 
 
 def shark_color(fraction: float, energy_frac: float) -> pygame.Color:
     """Map a shark-gene fraction to white→blue; stays bright, slight energy dim."""
     color = pygame.Color(0)
-    sat = 100.0 * _clamp01(fraction)  # 0=white(low) -> 100=blue(high)
-    value = 80.0 + 20.0 * _clamp01(energy_frac)  # always bright, a touch brighter when fed
-    color.hsva = (210, sat, value, 100)
+    sat = 100.0 * fraction  # 0=white(low) -> 100=blue(high)
+    value = 80.0 + 20.0 * min(1.0, max(0.0, energy_frac))  # a touch brighter when fed
+    color.hsva = (HUE_BLUE, sat, value, 100)
     return color
 
 
-def _clamp01(x: float) -> float:
-    return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+def _headings(vel: np.ndarray) -> np.ndarray:
+    """Unit heading per row; motionless rows point along +x."""
+    norm = np.sqrt(np.einsum("nc,nc->n", vel, vel))
+    return np.where(norm[:, None] > 0.0, vel / np.maximum(norm, 1e-12)[:, None], (1.0, 0.0))
 
 
 def draw_walls(surface: pygame.Surface, walls) -> None:
@@ -65,35 +89,51 @@ def draw_walls(surface: pygame.Surface, walls) -> None:
         pygame.draw.polygon(surface, WALL_EDGE, verts, 1)
 
 
-def draw_fish(surface: pygame.Surface, boid, color: pygame.Color) -> None:
-    """A small triangle pointing along the velocity, tinted by a gene."""
-    vel = boid.vel
-    heading = vel if vel.length_squared() > 0 else Vector2(1, 0)
-    heading = heading.normalize()
-    side = Vector2(-heading.y, heading.x)
-    tip = boid.pos + heading * 7
-    left = boid.pos - heading * 4 + side * 3
-    right = boid.pos - heading * 4 - side * 3
-    pygame.draw.polygon(surface, color, (tip, left, right))
+def draw_fish_all(surface: pygame.Surface, sim: Simulation, gene: str) -> None:
+    """Every fish as a small triangle pointing along its velocity, tinted by a gene.
+
+    The triangle geometry is computed for the whole school in a few array ops;
+    only the unavoidable per-polygon draw call remains a Python loop.
+    """
+    fish = sim.fish
+    if not len(fish):
+        return
+    heading = _headings(fish.vel)
+    side = np.stack([-heading[:, 1], heading[:, 0]], axis=1)
+    tips = (fish.pos + heading * FISH_NOSE).tolist()
+    lefts = (fish.pos - heading * FISH_TAIL + side * FISH_HALF_W).tolist()
+    rights = (fish.pos - heading * FISH_TAIL - side * FISH_HALF_W).tolist()
+    buckets = (
+        gene_fractions(fish.genes, FISH_SPEC, gene) * (COLOR_LUT_SIZE - 1)
+    ).astype(int).tolist()
+    for tip, left, right, bucket in zip(tips, lefts, rights, buckets):
+        pygame.draw.polygon(surface, FISH_COLOR_LUT[bucket], (tip, left, right))
 
 
-def draw_shark(surface, overlay, shark, cfg, color_gene) -> None:
-    """A kite — two triangles meeting at the crossbar — pointing along velocity, gene-tinted."""
-    energy_frac = shark.energy / cfg.shark_repro_energy
-    color = shark_color(shark.genome.gene_fraction(color_gene), energy_frac)
-    vel = shark.vel
-    heading = vel if vel.length_squared() > 0 else Vector2(1, 0)
-    heading = heading.normalize()
-    side = Vector2(-heading.y, heading.x)
-    pos = shark.pos
-    nose = pos + heading * 14.0  # long front point
-    left = pos + heading * 2.0 + side * 6.0  # crossbar, forward of center
-    right = pos + heading * 2.0 - side * 6.0
-    tail = pos - heading * 8.0  # back point
-    shade = color.lerp(pygame.Color(0, 0, 0), 0.25)  # darker back triangle for depth
-    pygame.draw.polygon(surface, color, (nose, left, right))  # front triangle
-    pygame.draw.polygon(surface, shade, (tail, left, right))  # back triangle
-    pygame.draw.circle(overlay, KILL_RING, pos, int(cfg.kill_radius), 1)
+def draw_sharks(
+    surface: pygame.Surface, overlay: pygame.Surface, sim: Simulation, gene: str
+) -> None:
+    """Every shark as a kite — two triangles meeting at the crossbar — pointing
+    along its velocity, gene-tinted, with its kill radius ringed on the overlay."""
+    sharks = sim.sharks
+    if not len(sharks):
+        return
+    cfg = sim.cfg
+    heading = _headings(sharks.vel)
+    side = np.stack([-heading[:, 1], heading[:, 0]], axis=1)
+    noses = (sharks.pos + heading * SHARK_NOSE).tolist()
+    lefts = (sharks.pos + heading * SHARK_CROSS_FWD + side * SHARK_HALF_W).tolist()
+    rights = (sharks.pos + heading * SHARK_CROSS_FWD - side * SHARK_HALF_W).tolist()
+    tails = (sharks.pos - heading * SHARK_TAIL).tolist()
+    fractions = gene_fractions(sharks.genes, SHARK_SPEC, gene)
+    energy_fracs = sharks.energy / cfg.shark_repro_energy
+    centers = sharks.pos.tolist()
+    for k in range(len(sharks)):
+        color = shark_color(fractions[k], energy_fracs[k])
+        shade = color.lerp(pygame.Color(0, 0, 0), SHARK_BACK_SHADE)
+        pygame.draw.polygon(surface, color, (noses[k], lefts[k], rights[k]))
+        pygame.draw.polygon(surface, shade, (tails[k], lefts[k], rights[k]))
+        pygame.draw.circle(overlay, KILL_RING, centers[k], int(cfg.kill_radius), 1)
 
 
 def main() -> None:
@@ -103,6 +143,8 @@ def main() -> None:
     pygame.display.set_caption("Coevolving Boids — fish vs. sharks")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("monospace", 14)
+    # One reusable transparent overlay (kill rings); cleared, not reallocated.
+    overlay = pygame.Surface((cfg.width, cfg.height), pygame.SRCALPHA)
 
     sim = Simulation(cfg)
     paused = False
@@ -130,7 +172,7 @@ def main() -> None:
                     shark_gene_idx = (shark_gene_idx + 1) % len(SHARK_GENE_NAMES)
                 elif event.key == pygame.K_o:
                     cfg.walls_enabled = not cfg.walls_enabled
-                    sim.walls = sim._build_walls()  # (re)scatter or clear shards
+                    sim.rebuild_walls()  # (re)scatter or clear shards
                 elif event.key == pygame.K_r:
                     sim = Simulation(cfg)
 
@@ -138,19 +180,17 @@ def main() -> None:
         shark_gene = SHARK_GENE_NAMES[shark_gene_idx]
 
         if not paused:
-            target = Vector2(pygame.mouse.get_pos()) if manual else None
+            target = pygame.mouse.get_pos() if manual else None
             sim.step(target)
 
         # --- Render ---
         screen.fill(OCEAN)
-        overlay = pygame.Surface((cfg.width, cfg.height), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 0))
 
         if cfg.walls_enabled:
             draw_walls(screen, sim.walls)
-        for f in sim.fish:
-            draw_fish(screen, f, fish_color(f.genome.gene_fraction(fish_gene)))
-        for s in sim.sharks:
-            draw_shark(screen, overlay, s, cfg, shark_gene)
+        draw_fish_all(screen, sim, fish_gene)
+        draw_sharks(screen, overlay, sim, shark_gene)
 
         screen.blit(overlay, (0, 0))
         _draw_hud(screen, font, sim, cfg, clock, manual, fish_gene, shark_gene)
@@ -185,7 +225,7 @@ def _draw_hud(screen, font, sim, cfg, clock, manual, fish_gene, shark_gene) -> N
     )
 
     for i, text in enumerate((fish_line, shark_line, status_line)):
-        screen.blit(font.render(text, True, HUD), (10, 10 + i * 18))
+        screen.blit(font.render(text, True, HUD), (HUD_X, HUD_Y + i * HUD_LINE_H))
 
 
 if __name__ == "__main__":

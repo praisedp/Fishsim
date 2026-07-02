@@ -1,33 +1,26 @@
 """Static geometric wall obstacles and soft-bounce avoidance.
 
 A handful of small convex polygon *shards* litter the sea. Fish and sharks steer
-away from them with a soft push (no hard stops), the same flavour of nudge the world
-edges use in ``sim._handle_edges``.
+away from them with a soft push (no hard stops), the same flavour of nudge the
+world edges use in ``sim._apply_edges_fish``.
 
-Pure vector logic — no pygame display, no global state — so it stays headless-testable
-like ``boid.py``. The shards never move, so the spatial index (:class:`WallField`) is
-built **once** and queried per entity, rather than rebuilt every tick like the fish
-:class:`~grid.SpatialGrid`.
-"""
+The shards never move, so :class:`WallField` packs their geometry into numpy
+arrays **once**, and :func:`avoid_all` answers for a whole population per tick
+with a single ``(points, shards, edges)`` signed-distance tensor. No pygame
+display code — headless-testable like the rest of the engine."""
 
 from __future__ import annotations
 
 import math
 
+import numpy as np
 from pygame.math import Vector2
 
 from config import Config
 
-
-def closest_point_on_segment(p: Vector2, a: Vector2, b: Vector2) -> Vector2:
-    """The point on segment ``a``–``b`` nearest to ``p`` (projection, clamped to ends)."""
-    ab = b - a
-    len_sq = ab.length_squared()
-    if len_sq == 0:
-        return Vector2(a)
-    t = (p - a).dot(ab) / len_sq
-    t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
-    return a + ab * t
+# Shards are triangles or quads (see WallField.scatter), so the packed edge
+# arrays are padded to four edges with `edge_valid` marking the real ones.
+MAX_EDGES = 4
 
 
 class Shard:
@@ -69,27 +62,24 @@ class Shard:
 
 
 class WallField:
-    """A static set of shards with a build-once cell index for fast lookups."""
+    """A static set of shards, packed once into arrays for :func:`avoid_all`."""
 
-    def __init__(self, shards: list[Shard], cell_size: float, margin: float):
+    def __init__(self, shards: list[Shard]):
         self.shards = shards
-        self.cell_size = cell_size
-        # Register each shard in every cell its (bbox + margin) overlaps, so a query at
-        # any point within ``margin`` of the shard finds it in its own cell.
-        self.cells: dict[tuple[int, int], list[Shard]] = {}
-        for shard in shards:
-            c0 = int((shard.min_x - margin) // cell_size)
-            c1 = int((shard.max_x + margin) // cell_size)
-            r0 = int((shard.min_y - margin) // cell_size)
-            r1 = int((shard.max_y + margin) // cell_size)
-            for col in range(c0, c1 + 1):
-                for row in range(r0, r1 + 1):
-                    self.cells.setdefault((col, row), []).append(shard)
-
-    def nearby(self, x: float, y: float) -> list[Shard]:
-        """Shards registered in the cell containing ``(x, y)`` (possibly empty)."""
-        key = (int(x // self.cell_size), int(y // self.cell_size))
-        return self.cells.get(key, ())
+        # Packed geometry for the vectorized avoid_all(): per shard, each edge's
+        # anchor vertex and outward normal, padded to MAX_EDGES, plus the bbox
+        # as (min_x, min_y, max_x, max_y).
+        count = len(shards)
+        self.edge_a = np.zeros((count, MAX_EDGES, 2))
+        self.edge_n = np.zeros((count, MAX_EDGES, 2))
+        self.edge_valid = np.zeros((count, MAX_EDGES), dtype=bool)
+        self.bbox = np.zeros((count, 4))
+        for k, shard in enumerate(shards):
+            for e, (a, _b, normal) in enumerate(shard.edges):
+                self.edge_a[k, e] = (a.x, a.y)
+                self.edge_n[k, e] = (normal.x, normal.y)
+                self.edge_valid[k, e] = True
+            self.bbox[k] = (shard.min_x, shard.min_y, shard.max_x, shard.max_y)
 
     @classmethod
     def scatter(cls, cfg: Config, rng) -> "WallField":
@@ -108,42 +98,72 @@ class WallField:
                 r = radius * rng.uniform(0.6, 1.0)
                 verts.append(Vector2(cx + math.cos(angle) * r, cy + math.sin(angle) * r))
             shards.append(Shard(verts))
-        return cls(shards, cfg.cell_size, cfg.wall_margin)
+        return cls(shards)
 
 
-def avoid(
-    pos: Vector2, shards, margin: float
-) -> tuple[Vector2, Vector2 | None]:
-    """Soft-bounce response for ``pos`` against ``shards``.
+def avoid_all(
+    pos: np.ndarray, field: WallField, margin: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Soft-bounce response for every position at once.
 
-    Returns ``(push, eject)``:
+    Returns ``(push, eject)``, both ``(n, 2)``:
 
     - ``push`` — a steering direction away from any wall face within ``margin``,
       stronger the closer (or deeper) the point is. Zero when clear.
-    - ``eject`` — a positional correction that lifts ``pos`` back out when it has
-      actually crossed *inside* a shard, or ``None``. Velocity nudges alone can't
-      rescue a point already inside (and sharks rewrite their velocity each tick), so
-      the ejection is the hard backstop.
+    - ``eject`` — a positional correction that lifts a point back out when it has
+      actually crossed *inside* a shard, else zero. Velocity nudges alone can't
+      rescue a point already inside (and sharks rewrite their velocity each
+      tick), so the ejection is the hard backstop.
+
+    The bbox+margin prefilter is for correctness as much as speed: the signed
+    distance below is to each face's *infinite line*, so without a spatial
+    filter a point far away but near a face's extension would get a spurious
+    push.
     """
-    push = Vector2(0, 0)
-    eject: Vector2 | None = None
-    for shard in shards:
-        # Signed distance to each edge's outward face; convex => inside iff all <= 0.
-        dists = [(pos - a).dot(n) for a, _b, n in shard.edges]
-        if not dists:
-            continue
-        max_sd = max(dists)
-        if max_sd <= 0.0:
-            # Inside the shard: push out through the nearest face (least-negative edge).
-            idx = dists.index(max_sd)
-            normal = shard.edges[idx][2]
-            depth = -max_sd
-            push += normal
-            correction = normal * depth
-            eject = correction if eject is None else eject + correction
-        else:
-            # Outside: any face we're within the band of contributes an outward shove.
-            for (a, _b, normal), sd in zip(shard.edges, dists):
-                if 0.0 <= sd < margin:
-                    push += normal * ((margin - sd) / margin)
+    n = len(pos)
+    push = np.zeros((n, 2))
+    eject = np.zeros((n, 2))
+    if n == 0 or not field.shards:
+        return push, eject
+
+    bbox = field.bbox
+    near = (
+        (pos[:, 0:1] >= bbox[:, 0] - margin)
+        & (pos[:, 0:1] <= bbox[:, 2] + margin)
+        & (pos[:, 1:2] >= bbox[:, 1] - margin)
+        & (pos[:, 1:2] <= bbox[:, 3] + margin)
+    )  # (n, shards)
+    if not near.any():
+        return push, eject
+
+    # Signed distance from every point to every face line: (point - anchor)·normal,
+    # shaped (n, shards, edges). Positive outside that face; a convex shard
+    # contains a point iff every face's distance is <= 0. Padded edges read as
+    # -inf so they never win the "least-negative face" argmax nor enter the band.
+    sd = np.einsum("nsec,sec->nse", pos[:, None, None, :] - field.edge_a, field.edge_n)
+    sd = np.where(field.edge_valid, sd, -np.inf)
+    max_sd = sd.max(axis=2)  # (n, shards)
+
+    inside = near & (max_sd <= 0.0)
+    n_idx, s_idx = np.nonzero(inside)  # the handful of point-in-shard incidents
+    if n_idx.size:
+        # Eject through the nearest (least-negative) face, push along its normal.
+        face = sd[n_idx, s_idx].argmax(axis=1)
+        normals = field.edge_n[s_idx, face]
+        depth = -max_sd[n_idx, s_idx]
+        np.add.at(push, n_idx, normals)
+        np.add.at(eject, n_idx, normals * depth[:, None])
+
+    # Outside a shard: every face whose band the point sits in shoves outward,
+    # scaled from 1 at the face down to 0 at the margin's edge.
+    band = (
+        near[:, :, None]
+        & ~inside[:, :, None]
+        & field.edge_valid
+        & (sd >= 0.0)
+        & (sd < margin)
+    )
+    if band.any():
+        weight = np.where(band, (margin - sd) / margin, 0.0)
+        push += np.einsum("nse,sec->nc", weight, field.edge_n)
     return push, eject

@@ -8,8 +8,6 @@ how fish and sharks are born, fed, and culled.
 
 from dataclasses import dataclass
 
-from genome import GENE_RANGES
-
 
 @dataclass
 class Config:
@@ -18,7 +16,7 @@ class Config:
     height: int = 800
     fps: int = 45
     num_fish: int = 440  # starting fish population
-    num_sharks: int = 0  # starting shark population
+    num_sharks: int = 10  # starting shark population
     wrap_edges: bool = True  # True = toroidal wrap-around, False = soft bounce
 
     # --- Shared physics (NOT per-animal) ---
@@ -35,13 +33,13 @@ class Config:
     repro_prob: float = 0.004  # per-tick chance a mature fish spawns a child
     mutation_rate: float = 0.5  # per-gene chance of a nudge when breeding
     mutation_sigma: float = 0.12  # nudge size, as a fraction of each gene's span
-    max_pop: int = 600  # hard cap on living fish (no floor: true ecosystem)
+    max_pop: int = 1000  # hard cap on living fish (no floor: true ecosystem)
 
     # --- Shark genetic algorithm (energy / hunger driven) ---
-    max_sharks: int = 30  # hard cap on living sharks (no floor: they can go extinct)
-    shark_start_energy: float = 120.0  # energy a fresh/immigrant shark begins with
-    shark_energy_per_fish: float = 9.0  # energy gained per fish eaten
-    shark_repro_energy: float = 250.0  # energy needed to spawn a child
+    max_sharks: int = 50  # hard cap on living sharks (no floor: they can go extinct)
+    shark_start_energy: float = 100.0  # energy a fresh/immigrant shark begins with
+    shark_energy_per_fish: float = 10.0  # energy gained per fish eaten
+    shark_repro_energy: float = 300.0  # energy needed to spawn a child
     shark_birth_cost: float = 500.0  # energy lost from the split at birth
     shark_metab_base: float = 0.05  # baseline energy burned per tick
     shark_metab_speed_k: float = 0.020  # extra burn per unit of max_speed gene
@@ -67,11 +65,3 @@ class Config:
     wall_margin: float = 26.0  # soft-bounce band; > max speed (5–6) so no tunneling
     wall_push: float = 0.5  # velocity-nudge strength near a wall face
     wall_border_margin: float = 60.0  # keep shards off the screen edges
-
-    @property
-    def cell_size(self) -> float:
-        # Sized to the largest *fish* perception so a fish's neighbours always live
-        # in the 9 surrounding cells (the tight, common case). Sharks see much
-        # further, so their prey query (grid.neighbours_at) scans as many cell-rings
-        # as its own perception needs rather than relying on the 3x3 guarantee.
-        return GENE_RANGES["perception"][1]
