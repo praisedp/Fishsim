@@ -65,13 +65,16 @@ class _SoABase:
 
 
 class FishState(_SoABase):
-    """The fish population: motion, genes, and breeding bookkeeping."""
+    """The fish population: motion, genes, body size, and the energy reserve that
+    foraging tops up and metabolism/growth drain."""
 
     def __init__(self, capacity: int):
         super().__init__(capacity, {
             "pos": ((2,), np.float64),
             "vel": ((2,), np.float64),
             "genes": ((FISH_SPEC.count,), np.float64),
+            "size": ((), np.float64),  # current body size (grows toward adult_size)
+            "energy": ((), np.float64),
             "generation": ((), np.int64),
             "age": ((), np.int64),
         })
@@ -89,12 +92,49 @@ class FishState(_SoABase):
         return self._view("genes")
 
     @property
+    def size(self) -> np.ndarray:
+        return self._view("size")
+
+    @property
+    def energy(self) -> np.ndarray:
+        return self._view("energy")
+
+    @property
     def generation(self) -> np.ndarray:
         return self._view("generation")
 
     @property
     def age(self) -> np.ndarray:
         return self._view("age")
+
+
+class FoodState(_SoABase):
+    """The food population: drifting plant particles fish eat. Each carries a
+    body ``size`` (drives its radius and energy) and an ``energy`` payload."""
+
+    def __init__(self, capacity: int):
+        super().__init__(capacity, {
+            "pos": ((2,), np.float64),
+            "vel": ((2,), np.float64),
+            "energy": ((), np.float64),
+            "size": ((), np.float64),
+        })
+
+    @property
+    def pos(self) -> np.ndarray:
+        return self._view("pos")
+
+    @property
+    def vel(self) -> np.ndarray:
+        return self._view("vel")
+
+    @property
+    def energy(self) -> np.ndarray:
+        return self._view("energy")
+
+    @property
+    def size(self) -> np.ndarray:
+        return self._view("size")
 
 
 class SharkState(_SoABase):

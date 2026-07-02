@@ -116,6 +116,85 @@ def _axis_offsets(ncells: int, wrap: bool) -> tuple[int, ...]:
     return (0, 1) if ncells == 2 else (0,)
 
 
+def _query_cells(pos: np.ndarray, grid: Grid, wrap: bool) -> tuple[np.ndarray, np.ndarray]:
+    """Which of ``grid``'s cells each of ``pos`` falls in (for cross-grid queries)."""
+    cx = np.floor(pos[:, 0] / grid.cell_w).astype(np.int64)
+    cy = np.floor(pos[:, 1] / grid.cell_h).astype(np.int64)
+    if wrap:
+        cx %= grid.nx
+        cy %= grid.ny
+    else:
+        np.clip(cx, 0, grid.nx - 1, out=cx)
+        np.clip(cy, 0, grid.ny - 1, out=cy)
+    return cx, cy
+
+
+def _gather_pairs(
+    grid: Grid,
+    q_cell_x: np.ndarray,
+    q_cell_y: np.ndarray,
+    q_pos: np.ndarray,
+    q_radii: np.ndarray,
+    t_pos: np.ndarray,
+    world: np.ndarray,
+    wrap: bool,
+    exclude_self: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Directed pairs ``(a, b)`` where target ``b`` (in ``grid``) lies within
+    query ``a``'s radius. ``a`` indexes ``q_pos``; ``b`` indexes ``t_pos`` (the
+    points ``grid`` was built over). Returns ``(a, b, rel, d2)`` with
+    ``rel = t_pos[b] - q_pos[a]`` (minimum-image when wrapping).
+
+    The shared core of :func:`perception_pairs` (query == target, self excluded)
+    and :func:`cross_pairs` (two different populations, no self concept).
+    """
+    nq = len(q_pos)
+    empty_i = np.empty(0, dtype=np.int64)
+    if nq == 0:
+        return empty_i, empty_i.copy(), np.empty((0, 2)), np.empty(0)
+
+    # Every (query, neighbour-cell) combination as flat arrays: K ≤ 9 offsets
+    # stacked into one (K, nq) block, so the ragged gather below runs once over
+    # all of them instead of once per offset.
+    xoffs = _axis_offsets(grid.nx, wrap)
+    yoffs = _axis_offsets(grid.ny, wrap)
+    dxs = np.array([dx for dx in xoffs for _dy in yoffs])
+    dys = np.array([dy for _dx in xoffs for dy in yoffs])
+    ncx = q_cell_x + dxs[:, None]
+    ncy = q_cell_y + dys[:, None]
+    src = np.tile(np.arange(nq), len(dxs))
+    if wrap:
+        ncx %= grid.nx
+        ncy %= grid.ny
+        ncell = (ncy * grid.nx + ncx).ravel()
+    else:
+        ok = ((ncx >= 0) & (ncx < grid.nx) & (ncy >= 0) & (ncy < grid.ny)).ravel()
+        src = src[ok]
+        ncell = (ncy * grid.nx + ncx).ravel()[ok]
+
+    # Ragged gather: query src[k] must be paired with every target in its
+    # neighbour cell's run of length reps[k]. Expand each query reps[k] times,
+    # then build each copy's position *within its own run* (0, 1, ..., reps[k]-1)
+    # by subtracting the run's global start from a flat arange. Adding the cell's
+    # start in `order` turns those run positions back into target indices.
+    reps = grid.counts[ncell]
+    total = int(reps.sum())
+    if total == 0:
+        return empty_i, empty_i.copy(), np.empty((0, 2)), np.empty(0)
+    a = np.repeat(src, reps)
+    run_first = np.repeat(np.cumsum(reps) - reps, reps)
+    within_run = np.arange(total) - run_first
+    b = grid.order[np.repeat(grid.starts[ncell], reps) + within_run]
+    rel = t_pos[b] - q_pos[a]
+    if wrap:
+        rel = min_image(rel, world)
+    d2 = np.einsum("pc,pc->p", rel, rel)
+    keep = d2 <= q_radii[a] ** 2
+    if exclude_self:
+        keep &= a != b
+    return a[keep], b[keep], rel[keep], d2[keep]
+
+
 def perception_pairs(
     grid: Grid,
     pos: np.ndarray,
@@ -130,50 +209,30 @@ def perception_pairs(
     excluded by index (``i != j``), *not* by distance — two fish at the exact
     same spot still see each other, which alignment/cohesion rely on.
     """
-    n = len(pos)
-    empty_i = np.empty(0, dtype=np.int64)
-    if n == 0:
-        return empty_i, empty_i.copy(), np.empty((0, 2)), np.empty(0)
+    return _gather_pairs(
+        grid, grid.cell_x, grid.cell_y, pos, radii, pos, world, wrap, exclude_self=True
+    )
 
-    # Every (fish, neighbour-cell) combination as flat arrays: K ≤ 9 offsets
-    # stacked into one (K, n) block, so the ragged gather below runs once over
-    # all of them instead of once per offset.
-    xoffs = _axis_offsets(grid.nx, wrap)
-    yoffs = _axis_offsets(grid.ny, wrap)
-    dxs = np.array([dx for dx in xoffs for _dy in yoffs])
-    dys = np.array([dy for _dx in xoffs for dy in yoffs])
-    ncx = grid.cell_x + dxs[:, None]
-    ncy = grid.cell_y + dys[:, None]
-    src = np.tile(np.arange(n), len(dxs))
-    if wrap:
-        ncx %= grid.nx
-        ncy %= grid.ny
-        ncell = (ncy * grid.nx + ncx).ravel()
-    else:
-        ok = ((ncx >= 0) & (ncx < grid.nx) & (ncy >= 0) & (ncy < grid.ny)).ravel()
-        src = src[ok]
-        ncell = (ncy * grid.nx + ncx).ravel()[ok]
 
-    # Ragged gather: fish src[k] must be paired with every fish in its
-    # neighbour cell's run of length reps[k]. Expand each source fish reps[k]
-    # times, then build each copy's position *within its own run*
-    # (0, 1, ..., reps[k]-1) by subtracting the run's global start from a flat
-    # arange. Adding the cell's start in `order` turns those run positions back
-    # into fish indices.
-    reps = grid.counts[ncell]
-    total = int(reps.sum())
-    if total == 0:
-        return empty_i, empty_i.copy(), np.empty((0, 2)), np.empty(0)
-    i = np.repeat(src, reps)
-    run_first = np.repeat(np.cumsum(reps) - reps, reps)
-    within_run = np.arange(total) - run_first
-    j = grid.order[np.repeat(grid.starts[ncell], reps) + within_run]
-    rel = pos[j] - pos[i]
-    if wrap:
-        rel = min_image(rel, world)
-    d2 = np.einsum("pc,pc->p", rel, rel)
-    keep = (i != j) & (d2 <= radii[i] ** 2)
-    return i[keep], j[keep], rel[keep], d2[keep]
+def cross_pairs(
+    grid_b: Grid,
+    pos_a: np.ndarray,
+    radii_a: np.ndarray,
+    pos_b: np.ndarray,
+    world: np.ndarray,
+    wrap: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Directed cross-population pairs ``(a, b)`` with B-point ``b`` inside
+    A-point ``a``'s radius. ``grid_b`` is a :class:`Grid` built over ``pos_b``;
+    A-points are re-binned into its cells. Returns ``(a, b, rel, d2)`` with
+    ``rel = pos_b[b] - pos_a[a]`` — no self-exclusion (the populations differ).
+
+    One pass over fish→food serves foraging (steer toward food), eating (filter
+    by mouth radius), and wakes (by symmetry, food pushed by nearby fish)."""
+    cx, cy = _query_cells(pos_a, grid_b, wrap)
+    return _gather_pairs(
+        grid_b, cx, cy, pos_a, radii_a, pos_b, world, wrap, exclude_self=False
+    )
 
 
 def nearest_points(

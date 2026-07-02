@@ -21,15 +21,19 @@ import numpy as np
 
 # --- Gene declarations (single source of truth) -------------------------------
 
-# Inclusive (min, max) bounds per fish gene.
+# Inclusive (min, max) bounds per fish gene. Speed and body physics are no
+# longer genes — they derive from a fish's ``size`` state (see physiology.py),
+# which grows toward the ``adult_size`` gene. Every gene carries a real
+# trade-off so evolution must balance rather than max everything.
 GENE_RANGES: dict[str, tuple[float, float]] = {
-    "w_sep": (0.0, 3.0),         # separation weight
-    "w_ali": (0.0, 3.0),         # alignment weight
-    "w_coh": (0.0, 3.0),         # cohesion weight
-    "w_flee": (0.0, 6.0),        # flee-from-shark weight
-    "perception": (20.0, 80.0),  # how far it sees neighbours
-    "max_speed": (2.0, 5.0),     # top speed
-    "fear": (0.5, 2.0),          # multiplies the base flee radius
+    "w_sep": (0.0, 3.0),          # separation weight
+    "w_ali": (0.0, 3.0),          # alignment weight
+    "w_coh": (0.0, 3.0),          # cohesion weight
+    "w_flee": (0.0, 6.0),         # flee-from-shark weight
+    "w_food": (0.0, 6.0),         # foraging attraction weight
+    "perception": (20.0, 80.0),   # sight radius (neighbours/food/sharks); costs metabolism
+    "adult_size": (1.5, 6.0),     # target body size — drives speed, mass, energy cap, metabolism
+    "repro_frac": (0.5, 0.95),    # breeds when energy >= this fraction of its cap
 }
 
 # What makes a good hunter. Each gene has a real trade-off so evolution must
@@ -81,14 +85,15 @@ FISH_SPEC = GeneSpec(GENE_RANGES)
 SHARK_SPEC = GeneSpec(SHARK_GENE_RANGES)
 
 # Column indices, precomputed once so hot code reads like prose instead of
-# doing dict lookups: genes[:, F_MAXSPD] is a whole population's top speeds.
+# doing dict lookups: genes[:, F_PERC] is a whole population's sight radii.
 F_WSEP = FISH_SPEC.col("w_sep")
 F_WALI = FISH_SPEC.col("w_ali")
 F_WCOH = FISH_SPEC.col("w_coh")
 F_WFLEE = FISH_SPEC.col("w_flee")
+F_WFOOD = FISH_SPEC.col("w_food")
 F_PERC = FISH_SPEC.col("perception")
-F_MAXSPD = FISH_SPEC.col("max_speed")
-F_FEAR = FISH_SPEC.col("fear")
+F_ADULT = FISH_SPEC.col("adult_size")
+F_REPROF = FISH_SPEC.col("repro_frac")
 
 S_MAXSPD = SHARK_SPEC.col("max_speed")
 S_PERC = SHARK_SPEC.col("perception")

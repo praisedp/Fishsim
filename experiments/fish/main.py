@@ -32,8 +32,17 @@ HUD = (180, 200, 220)
 WALL = (110, 118, 126)  # muted stony grey
 WALL_EDGE = (70, 76, 82)  # darker facet outline
 HUE_BLUE = 210.0  # base hue of both palettes (blue)
+HUE_GREEN = 120.0  # food hue
 
-# Body geometry, in pixels along/across the heading.
+# Body geometry, in pixels along/across the heading. Fish geometry is for a
+# fish drawn at DRAW_SIZE_REF and scales with each fish's actual size. This uses
+# its own reference (not cfg.size_ref) so on-screen size tracks a fish's real
+# body size independently of the physics speed/mass scaling.
+DRAW_SIZE_REF = 6.0  # a fish of this size draws at the base geometry below
+# The drawn size is clamped to this band so tiny juveniles stay visible and
+# giants don't dominate — purely visual, no effect on the simulation.
+DRAW_MIN_SIZE = 3.5
+DRAW_MAX_SIZE = 6.0
 FISH_NOSE = 7.0
 FISH_TAIL = 4.0
 FISH_HALF_W = 3.0
@@ -63,6 +72,16 @@ def fish_color(fraction: float) -> pygame.Color:
 FISH_COLOR_LUT = [fish_color(k / (COLOR_LUT_SIZE - 1)) for k in range(COLOR_LUT_SIZE)]
 
 
+def food_color(fullness: float) -> pygame.Color:
+    """Green, dimmer as a food particle is depleted (here always ~full)."""
+    color = pygame.Color(0)
+    color.hsva = (HUE_GREEN, 70, 45 + 55 * fullness, 100)  # dark green -> bright green
+    return color
+
+
+FOOD_COLOR_LUT = [food_color(k / (COLOR_LUT_SIZE - 1)) for k in range(COLOR_LUT_SIZE)]
+
+
 def shark_color(fraction: float, energy_frac: float) -> pygame.Color:
     """Map a shark-gene fraction to white→blue; stays bright, slight energy dim."""
     color = pygame.Color(0)
@@ -89,8 +108,24 @@ def draw_walls(surface: pygame.Surface, walls) -> None:
         pygame.draw.polygon(surface, WALL_EDGE, verts, 1)
 
 
+def draw_food(surface: pygame.Surface, sim: Simulation) -> None:
+    """Food as small green dots, radius following each particle's size."""
+    food = sim.food
+    if not len(food):
+        return
+    centers = food.pos.tolist()
+    radii = np.maximum(1, np.round(food.size)).astype(int).tolist()
+    # Fullness = energy relative to a fresh particle of that size (≈1 at spawn).
+    fresh = sim.cfg.food_energy_k * food.size * food.size
+    fullness = np.clip(food.energy / np.maximum(fresh, 1e-9), 0.0, 1.0)
+    buckets = (fullness * (COLOR_LUT_SIZE - 1)).astype(int).tolist()
+    for center, radius, bucket in zip(centers, radii, buckets):
+        pygame.draw.circle(surface, FOOD_COLOR_LUT[bucket], center, radius)
+
+
 def draw_fish_all(surface: pygame.Surface, sim: Simulation, gene: str) -> None:
-    """Every fish as a small triangle pointing along its velocity, tinted by a gene.
+    """Every fish as a small triangle pointing along its velocity, tinted by a gene
+    and scaled by its body size.
 
     The triangle geometry is computed for the whole school in a few array ops;
     only the unavoidable per-polygon draw call remains a Python loop.
@@ -100,9 +135,12 @@ def draw_fish_all(surface: pygame.Surface, sim: Simulation, gene: str) -> None:
         return
     heading = _headings(fish.vel)
     side = np.stack([-heading[:, 1], heading[:, 0]], axis=1)
-    tips = (fish.pos + heading * FISH_NOSE).tolist()
-    lefts = (fish.pos - heading * FISH_TAIL + side * FISH_HALF_W).tolist()
-    rights = (fish.pos - heading * FISH_TAIL - side * FISH_HALF_W).tolist()
+    # Bigger fish draw bigger, but clamped to a visible band (min/max caps).
+    drawn = np.clip(fish.size, DRAW_MIN_SIZE, DRAW_MAX_SIZE)
+    scale = (drawn / DRAW_SIZE_REF)[:, None]
+    tips = (fish.pos + heading * FISH_NOSE * scale).tolist()
+    lefts = (fish.pos + (-heading * FISH_TAIL + side * FISH_HALF_W) * scale).tolist()
+    rights = (fish.pos + (-heading * FISH_TAIL - side * FISH_HALF_W) * scale).tolist()
     buckets = (
         gene_fractions(fish.genes, FISH_SPEC, gene) * (COLOR_LUT_SIZE - 1)
     ).astype(int).tolist()
@@ -189,6 +227,7 @@ def main() -> None:
 
         if cfg.walls_enabled:
             draw_walls(screen, sim.walls)
+        draw_food(screen, sim)
         draw_fish_all(screen, sim, fish_gene)
         draw_sharks(screen, overlay, sim, shark_gene)
 
@@ -208,8 +247,10 @@ def _draw_hud(screen, font, sim, cfg, clock, manual, fish_gene, shark_gene) -> N
     edges = "wrap" if cfg.wrap_edges else "bounce"
 
     fish_line = (
-        f"FISH   pop:{int(s['population']):3d}  births:{int(s['births'])}  "
-        f"deaths:{int(s['deaths'])}  gen:{s['generation']:4.1f}   "
+        f"FISH   pop:{int(s['population']):4d}  births:{int(s['births'])}  "
+        f"deaths:{int(s['deaths'])}  starv:{int(s['starvations'])}  "
+        f"gen:{s['generation']:4.1f}  size:{s['fish_size']:4.1f}  "
+        f"energy:{s['fish_energy']:5.1f}   "
         + "  ".join(f"{n}:{s[n]:.2f}" for n in GENE_NAMES)
     )
     shark_line = (
@@ -217,6 +258,7 @@ def _draw_hud(screen, font, sim, cfg, clock, manual, fish_gene, shark_gene) -> N
         f"deaths:{int(s['shark_deaths'])}  gen:{s['shark_generation']:4.1f}  "
         f"energy:{s['shark_energy']:5.1f}   "
         + "  ".join(f"{n}:{s['shark_' + n]:.1f}" for n in SHARK_GENE_NAMES)
+        + f"      FOOD count:{int(s['food_count'])}"
     )
     status_line = (
         f"fps:{clock.get_fps():3.0f}  shark:{mode}  edges:{edges}   "

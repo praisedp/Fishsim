@@ -1,27 +1,30 @@
-"""The simulation world: a coevolving ecosystem of fish and sharks.
+"""The simulation world: a coevolving ecosystem of food, fish, and sharks.
 
-This is the genetic-algorithm engine for *both* species. Each tick:
+Energy is the currency of life. Each tick:
 
-- **Sharks hunt** the nearest fish they can see (limited by their ``perception``
-  gene), aiming at a predicted intercept (their ``lead`` gene) and chasing at their
-  ``max_speed`` gene. Eating a fish restores energy; every tick burns some
-  (faster/keener-sighted sharks burn more). Out of energy → the shark starves and
-  dies; well-fed → it spawns a mutated child, splitting its energy.
-- **Fish flee** the nearest shark and flock, then mature ones occasionally breed
-  mutated copies of themselves.
+- **Food** (drifting plant particles) spawns at random, carries an energy payload
+  scaled by its size, drifts and weakly clumps, and shies away from the wakes of
+  passing fish and sharks.
+- **Fish** flock (separation/alignment/cohesion), flee the nearest shark, and
+  steer toward nearby food. They eat food to gain energy, pay a metabolic cost
+  every tick (bigger/faster fish pay more), grow from juvenile toward a genetic
+  ``adult_size``, **starve** if energy hits zero, and **breed** by splitting their
+  reserve once well-fed and grown. Body size derives speed (small = fast),
+  momentum (heavy = sluggish), storage cap, and metabolism — so life-history
+  strategy is itself under selection.
+- **Sharks hunt** the nearest fish they can see, aiming at a predicted intercept,
+  and live or die by their own energy budget; a bigger fish is a bigger meal.
 
-There are no population floors: if the sharks can't catch enough they go extinct and
-the fish fill the sea; if they're too good they eat everything and then starve. Good
-genes — dodging for fish, hunting for sharks — spread on their own. No generations,
-no resets.
+There are no population floors: carrying capacity emerges from the food supply.
+Good genes — foraging and dodging for fish, hunting for sharks — spread on their
+own. No generations, no resets.
 
-Populations live in struct-of-arrays form (:mod:`state`), and every per-tick rule
-below is a whole-population array operation — see :mod:`neighbors` for the pair
-search and :mod:`steering` for the flocking math. Distances are toroidal
-(minimum-image) whenever ``wrap_edges`` is on.
-
-Deliberately free of any pygame code so the simulation can be stepped and
-unit-tested headlessly.
+Populations live in struct-of-arrays form (:mod:`state`); every per-tick rule is
+a whole-population array operation — see :mod:`neighbors` for the spatial pair
+search, :mod:`steering` for the flocking math, and :mod:`physiology` for the
+size-derived body physics. Distances are toroidal (minimum-image) when
+``wrap_edges`` is on. No pygame code, so the sim is steppable and unit-testable
+headlessly.
 """
 
 from __future__ import annotations
@@ -30,8 +33,9 @@ import numpy as np
 
 from config import Config
 from genome import (
-    F_MAXSPD,
+    F_ADULT,
     F_PERC,
+    F_REPROF,
     FISH_SPEC,
     GENE_NAMES,
     S_LEAD,
@@ -42,8 +46,9 @@ from genome import (
     mutate_genes,
     random_genes,
 )
-from neighbors import build_grid, min_image, nearest_points, perception_pairs
-from state import FishState, SharkState
+from neighbors import build_grid, cross_pairs, min_image, nearest_points, perception_pairs
+from physiology import energy_cap_of, mass_rel_of, max_speed_of, metabolism
+from state import FishState, FoodState, SharkState
 from steering import EPS, fish_accelerations, limit_norm
 from walls import WallField, avoid_all
 
@@ -52,10 +57,11 @@ WANDER_TURN_DEG = 20.0  # max random heading change per tick while roaming
 WANDER_AHEAD = 50.0  # how far ahead of a roaming shark its target sits
 SHARK_SPAWN_JITTER = 10.0  # newborn shark's offset from its parent
 FISH_SPAWN_JITTER = 8.0  # newborn fish's offset from its parent
+FOUNDER_ENERGY_FRAC = 0.6  # starting energy of founders/inserted fish, as frac of cap
 
-# Cells sized to the largest *fish* perception so a fish's neighbours always live
-# in the 9 surrounding cells. Sharks see much further, but their prey search is a
-# dense shark×fish distance matrix, so it never touches the grid.
+# Cells sized to the largest *fish* perception so a fish's neighbours (and the
+# food it can see) always live in the 9 surrounding cells. Sharks see further,
+# but their prey search is a dense shark×fish matrix, so it skips the grid.
 CELL_MIN = float(FISH_SPEC.hi[F_PERC])
 
 
@@ -70,11 +76,17 @@ class Simulation:
 
         self.fish = FishState(capacity=max(cfg.max_pop, cfg.num_fish))
         self.sharks = SharkState(capacity=max(cfg.max_sharks, cfg.num_sharks))
+        self.food = FoodState(capacity=cfg.max_food)
         self._spawn_initial_populations()
+
+        # Per-tick foraging pairs (fish->food), stashed between the sense pass and
+        # eating so the expensive cross-query runs only once. See step().
+        self._forage: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
 
         # Lifetime tallies + a per-step snapshot for the HUD.
         self.births = 0
         self.deaths = 0
+        self.starvations = 0
         self.shark_births = 0
         self.shark_deaths = 0
         self.stats: dict[str, float] = {}
@@ -95,15 +107,17 @@ class Simulation:
         cfg = self.cfg
         n = cfg.num_fish
         genes = random_genes(self.rng, FISH_SPEC, n)
+        # Founders start as grown adults at their genetic size, moderately fed, so
+        # the sim opens with a viable breeding population rather than helpless fry.
+        size = genes[:, F_ADULT].copy()
         self.fish.append(
             pos=self.rng.uniform(0, self.world, (n, 2)),
-            vel=self._random_headings(genes[:, F_MAXSPD]),
+            vel=self._random_headings(max_speed_of(size, cfg)),
             genes=genes,
+            size=size,
+            energy=FOUNDER_ENERGY_FRAC * energy_cap_of(size, cfg),
             generation=np.zeros(n, dtype=np.int64),
-            # Seed a spread of ages so a founding population isn't uniformly
-            # immature — some can breed right away instead of all waiting out
-            # maturity together.
-            age=self.rng.integers(0, cfg.maturity_age + 1, n),
+            age=np.zeros(n, dtype=np.int64),
         )
 
         s = cfg.num_sharks
@@ -118,25 +132,31 @@ class Simulation:
 
     def _random_headings(self, max_speeds: np.ndarray) -> np.ndarray:
         """``(k, 2)`` velocities: random directions, speeds between the floor and
-        each fish's own top speed."""
+        each fish's own (size-derived) top speed."""
         angle = self.rng.uniform(0, 2 * np.pi, len(max_speeds))
         speed = self.rng.uniform(self.cfg.min_speed, max_speeds)
         return np.stack([np.cos(angle), np.sin(angle)], axis=1) * speed[:, None]
 
-    def add_fish(self, pos, genes=None, vel=None, age: int = 0, generation: int = 0) -> None:
-        """Insert a single fish (mid-range genes by default) — mainly for tests."""
+    def add_fish(self, pos, genes=None, vel=None, size=None, energy=None, generation=0) -> None:
+        """Insert a single fish — mainly for tests. Defaults: mid-range genes, size
+        at the genome's adult target, energy at a fraction of the derived cap."""
+        cfg = self.cfg
         genes = FISH_SPEC.mid() if genes is None else np.asarray(genes, dtype=float)
-        vel = (
-            self._random_headings(np.array([genes[F_MAXSPD]]))
-            if vel is None
-            else np.asarray(vel, dtype=float)[None]
-        )
+        size = float(genes[F_ADULT]) if size is None else float(size)
+        cap = float(energy_cap_of(size, cfg))
+        energy = FOUNDER_ENERGY_FRAC * cap if energy is None else float(energy)
+        if vel is None:
+            vel = self._random_headings(np.array([max_speed_of(size, cfg)]))
+        else:
+            vel = np.asarray(vel, dtype=float)[None]
         self.fish.append(
             pos=np.asarray(pos, dtype=float)[None],
             vel=vel,
             genes=genes[None],
+            size=np.array([size]),
+            energy=np.array([energy]),
             generation=np.array([generation]),
-            age=np.array([age]),
+            age=np.array([0]),
         )
 
     def add_shark(self, pos, genes=None, energy: float | None = None) -> None:
@@ -151,6 +171,16 @@ class Simulation:
             energy=np.array([self.cfg.shark_start_energy if energy is None else energy]),
         )
 
+    def add_food(self, pos, size: float, energy: float | None = None) -> None:
+        """Insert a single food particle — mainly for tests."""
+        energy = self.cfg.food_energy_k * size * size if energy is None else energy
+        self.food.append(
+            pos=np.asarray(pos, dtype=float)[None],
+            vel=np.zeros((1, 2)),
+            energy=np.array([float(energy)]),
+            size=np.array([float(size)]),
+        )
+
     # --- One simulation tick -----------------------------------------------
 
     def step(self, manual_target=None) -> None:
@@ -158,8 +188,16 @@ class Simulation:
 
         ``manual_target`` (the mouse, as an ``(x, y)`` pair) makes the *nearest*
         shark chase that point; every other shark hunts autonomously.
+
+        Ordering note: pair-index arrays (fish–fish ``i/j``, fish–food in
+        ``self._forage``) are invalidated by any ``compact``. So all reads that
+        use them happen *before* the compactions (eat food, starve fish, predate)
+        that shrink those populations.
         """
         cfg = self.cfg
+
+        # New food appears.
+        self._food_spawn()
 
         # Sharks move first so fish react to their new positions.
         if len(self.sharks):
@@ -170,9 +208,15 @@ class Simulation:
             self._confine_sharks()
             self._apply_walls(self.sharks)
 
-        # Fish pass 1 (read): flock with visible neighbours, flee the nearest shark.
+        # Fish sense (read) then move (write): flock, flee the nearest shark, and
+        # steer toward nearby food.
+        self._forage = None
         if len(self.fish):
             fish = self.fish
+            size = fish.size
+            max_speed = max_speed_of(size, cfg)
+            mass_rel = mass_rel_of(size, cfg)
+
             grid = build_grid(fish.pos, cfg.width, cfg.height, CELL_MIN, cfg.wrap_edges)
             i, j, rel, d2 = perception_pairs(
                 grid, fish.pos, fish.genes[:, F_PERC], self.world, cfg.wrap_edges
@@ -183,21 +227,164 @@ class Simulation:
                 )
             else:
                 flee_offset = flee_d2 = None  # no sharks alive -> nothing to flee
-            accel = fish_accelerations(
-                fish.vel, fish.genes, i, j, rel, d2, flee_offset, flee_d2, cfg
-            )
+            food_desire = self._forage_desire(grid_radii=fish.genes[:, F_PERC])
 
-            # Pass 2 (write): integrate, then resolve walls and world edges.
-            self._integrate_fish(accel)
-            self._apply_walls(self.fish, max_speed=fish.genes[:, F_MAXSPD])
+            accel = fish_accelerations(
+                fish.vel, fish.genes, max_speed, i, j, rel, d2,
+                flee_offset, flee_d2, food_desire, cfg,
+            )
+            self._integrate_fish(accel, mass_rel, max_speed)
+            self._apply_walls(self.fish, max_speed=max_speed)
             self._apply_edges_fish()
 
-        # Genetic algorithm: predation feeds sharks, then births and deaths.
+        # Energy economy: eat, burn/grow, starve. (Uses self._forage before any
+        # fish/food compaction invalidates its indices.)
+        self._fish_eat()
+        self._fish_metabolise_and_grow()
+        self._fish_starve()
+
+        # Predation, then births and deaths for both species.
         self._predate()
         self._shark_metabolise_and_die()
         self._shark_reproduce()
         self._fish_reproduce()
+
+        # Food drifts, clumps, and scatters from wakes (after fish have moved).
+        self._food_physics()
         self._update_stats()
+
+    # --- Food ---------------------------------------------------------------
+
+    def _food_spawn(self) -> None:
+        """Spawn a Poisson trickle of new food, bounded by the cap's headroom.
+        Bigger particles carry proportionally more energy (``k * size²``)."""
+        cfg = self.cfg
+        headroom = cfg.max_food - len(self.food)
+        if headroom <= 0:
+            return
+        k = min(headroom, int(self.rng.poisson(cfg.food_spawn_rate)))
+        if k == 0:
+            return
+        size = self.rng.uniform(cfg.food_size_lo, cfg.food_size_hi, k)
+        self.food.append(
+            pos=self.rng.uniform(0, self.world, (k, 2)),
+            vel=np.zeros((k, 2)),
+            energy=cfg.food_energy_k * size * size,
+            size=size,
+        )
+
+    def _forage_desire(self, grid_radii: np.ndarray) -> np.ndarray:
+        """Per-fish steering desire toward nearby food ``(n, 2)``, and stash the
+        fish→food pairs for :meth:`_fish_eat`.
+
+        One `cross_pairs` pass (fish query a grid built over food) serves both the
+        attraction here (mean direction to visible food) and eating later. Fish
+        with no food in range get a zero desire.
+        """
+        n = len(self.fish)
+        desire = np.zeros((n, 2))
+        if not len(self.food):
+            return desire
+        cfg = self.cfg
+        food_grid = build_grid(
+            self.food.pos, cfg.width, cfg.height, CELL_MIN, cfg.wrap_edges
+        )
+        fi, fj, frel, fd2 = cross_pairs(
+            food_grid, self.fish.pos, grid_radii, self.food.pos, self.world, cfg.wrap_edges
+        )
+        self._forage = (fi, fj, fd2)
+        if len(fi):
+            cnt = np.maximum(np.bincount(fi, minlength=n), 1)
+            for c in (0, 1):
+                desire[:, c] = np.bincount(fi, weights=frel[:, c], minlength=n) / cnt
+        return desire
+
+    def _fish_eat(self) -> None:
+        """Fish consume food within their (size-scaled) mouth radius.
+
+        Each food goes to its single nearest in-range fish (no double-counting),
+        but a fish may swallow several foods in one tick. Distances are those from
+        the sense pass — a tick's swim (≤ a few px) is well inside the mouth band.
+        """
+        forage = self._forage
+        self._forage = None
+        if forage is None or not len(self.food) or not len(self.fish):
+            return
+        cfg = self.cfg
+        fish, food = self.fish, self.food
+        fi, fj, fd2 = forage
+        within = fd2 <= (cfg.eat_radius_k * fish.size[fi]) ** 2
+        if not within.any():
+            return
+        ci, cj, cd2 = fi[within], fj[within], fd2[within]
+        # For each food (cj), keep only its nearest fish: sort by food then
+        # distance, take the first row of each food's run.
+        order = np.lexsort((cd2, cj))
+        cj_s, ci_s = cj[order], ci[order]
+        first = np.empty(len(cj_s), dtype=bool)
+        first[0] = True
+        first[1:] = cj_s[1:] != cj_s[:-1]
+        win_food, win_fish = cj_s[first], ci_s[first]
+
+        energy = fish.energy
+        np.add.at(energy, win_fish, food.energy[win_food])
+        np.minimum(energy, energy_cap_of(fish.size, cfg), out=energy)
+        eaten = np.zeros(len(food), dtype=bool)
+        eaten[win_food] = True
+        food.compact(~eaten)
+
+    def _food_physics(self) -> None:
+        """Drift + weak clumping + wake avoidance, all speed-capped below the fish
+        minimum speed so food can never outrun a fish."""
+        cfg = self.cfg
+        food = self.food
+        m = len(food)
+        if m == 0:
+            return
+        vel = food.vel  # view; accumulate contributions in place
+        wrap = cfg.wrap_edges
+
+        # Weak clumping: nudge toward the local food centroid.
+        if cfg.food_clump_k > 0.0:
+            grid = build_grid(food.pos, cfg.width, cfg.height, cfg.food_clump_radius, wrap)
+            radii = np.full(m, cfg.food_clump_radius)
+            ci, _cj, crel, _cd2 = perception_pairs(grid, food.pos, radii, self.world, wrap)
+            if len(ci):
+                cnt = np.maximum(np.bincount(ci, minlength=m), 1)
+                coh = np.zeros((m, 2))
+                for c in (0, 1):
+                    coh[:, c] = np.bincount(ci, weights=crel[:, c], minlength=m) / cnt
+                vel += cfg.food_clump_k * limit_norm(coh, 1.0)
+
+        # Wakes: nearby fish and sharks shove food away.
+        self._food_wake(vel, self.fish, cfg.food_wake_radius, cfg.food_wake_k)
+        self._food_wake(vel, self.sharks, cfg.shark_wake_radius, cfg.food_wake_k)
+
+        # Brownian jitter, damping, hard speed cap, then move + confine.
+        vel += self.rng.normal(0.0, cfg.food_wander_sigma, (m, 2))
+        food.vel[:] = limit_norm(vel * cfg.food_damp, cfg.food_max_speed)
+        pos = food.pos
+        pos += food.vel
+        if wrap:
+            np.mod(pos, self.world, out=pos)
+        else:
+            np.clip(pos, (0.0, 0.0), self.world, out=pos)
+
+    def _food_wake(self, vel: np.ndarray, movers, radius: float, strength: float) -> None:
+        """Push food away from nearby ``movers`` (fish or sharks), stronger up
+        close. The final speed cap keeps this gentle enough to stay catchable."""
+        if strength <= 0.0 or not len(movers) or not len(self.food):
+            return
+        cfg = self.cfg
+        grid = build_grid(movers.pos, cfg.width, cfg.height, radius, cfg.wrap_edges)
+        radii = np.full(len(self.food), radius)
+        fi, _mj, rel, d2 = cross_pairs(
+            grid, self.food.pos, radii, movers.pos, self.world, cfg.wrap_edges
+        )
+        if not len(fi):
+            return
+        away = -rel / np.maximum(d2, EPS)[:, None]  # rel points mover-ward
+        np.add.at(vel, fi, strength * away)
 
     # --- Shark targeting ----------------------------------------------------
 
@@ -258,9 +445,9 @@ class Simulation:
 
     def _predate(self) -> None:
         """Each shark catches at most ONE fish per tick — the nearest one within
-        ``kill_radius`` — and gains energy for it. Capping intake at one fish (a
-        shark can only seize one at a time) stops a single shark from vacuuming a
-        whole cluster and breeding explosively; it's the main predator–prey brake.
+        ``kill_radius`` — and gains energy scaled by that fish's mass (a bigger
+        fish is a bigger meal). Capping intake at one fish stops a single shark
+        from vacuuming a whole cluster; it's the main predator–prey brake.
 
         The distance matrix is precomputed, but the per-shark walk stays a
         deliberate sequential loop (≤ ``max_sharks`` rows): an earlier shark's
@@ -282,7 +469,7 @@ class Simulation:
             f = candidates.argmin()
             if candidates[f] <= kill2:
                 eaten[f] = True
-                sharks.energy[s] += cfg.shark_energy_per_fish
+                sharks.energy[s] += cfg.shark_meal_energy_k * fish.size[f] ** 2
         if eaten.any():
             self.deaths += fish.compact(~eaten)
 
@@ -336,39 +523,56 @@ class Simulation:
         self.shark_births += k
 
     def _fish_reproduce(self) -> None:
-        """Mature fish occasionally spawn a mutated child nearby (asexual)."""
+        """A grown, well-fed fish spawns a juvenile, splitting its energy reserve.
+
+        Eligible = adult enough (``size >= maturity_size_frac * adult_size``) AND
+        energy at/above its genetic ``repro_frac`` of cap AND able to afford the
+        birth cost. Breed in row order until the safety cap is hit.
+        """
         cfg = self.cfg
         fish = self.fish
         headroom = cfg.max_pop - len(fish)
         if headroom <= 0 or not len(fish):
             return
-        breeding = (fish.age >= cfg.maturity_age) & (
-            self.rng.random(len(fish)) < cfg.repro_prob
+        genes, size, energy = fish.genes, fish.size, fish.energy
+        cap = energy_cap_of(size, cfg)
+        invest = energy * 0.5
+        eligible = (
+            (size >= cfg.maturity_size_frac * genes[:, F_ADULT])
+            & (energy >= genes[:, F_REPROF] * cap)
+            & (invest - cfg.fish_birth_cost > 0)
         )
-        parents = np.flatnonzero(breeding)[:headroom]
+        parents = np.flatnonzero(eligible)[:headroom]
         if not parents.size:
             return
         k = parents.size
+        juvenile = np.full(k, cfg.juvenile_size)
+        child_cap = energy_cap_of(juvenile, cfg)
+        child_energy = np.minimum(invest[parents] - cfg.fish_birth_cost, child_cap)
+        energy[parents] *= 0.5
         child_genes = mutate_genes(
-            self.rng, FISH_SPEC, fish.genes[parents], cfg.mutation_rate, cfg.mutation_sigma
+            self.rng, FISH_SPEC, genes[parents], cfg.mutation_rate, cfg.mutation_sigma
         )
         jitter = self.rng.uniform(-FISH_SPAWN_JITTER, FISH_SPAWN_JITTER, (k, 2))
         self.fish.append(
             pos=fish.pos[parents] + jitter,
-            vel=self._random_headings(child_genes[:, F_MAXSPD]),
+            vel=self._random_headings(max_speed_of(juvenile, cfg)),
             genes=child_genes,
+            size=juvenile,
+            energy=child_energy,
             generation=fish.generation[parents] + 1,
             age=np.zeros(k, dtype=np.int64),
         )
         self.births += k
 
-    # --- Fish motion ----------------------------------------------------------
+    # --- Fish motion & energy -------------------------------------------------
 
-    def _integrate_fish(self, accel: np.ndarray) -> None:
-        """Apply the tick's accelerations: speed-clamped velocity, then position."""
+    def _integrate_fish(self, accel: np.ndarray, mass_rel: np.ndarray, max_speed: np.ndarray) -> None:
+        """Apply the tick's accelerations with momentum (``a = force / mass``), a
+        size-derived speed clamp, then integrate position."""
         cfg = self.cfg
         fish = self.fish
-        vel = limit_norm(fish.vel + accel, fish.genes[:, F_MAXSPD])
+        vel = limit_norm(fish.vel + accel / mass_rel[:, None], max_speed)
         # Keep a minimum speed so isolated fish keep drifting instead of freezing.
         speed2 = np.einsum("nc,nc->n", vel, vel)
         slow = (speed2 > 0.0) & (speed2 < cfg.min_speed**2)
@@ -377,6 +581,40 @@ class Simulation:
         fish.vel[:] = vel
         fish.pos[:] += vel
         fish.age[:] += 1
+
+    def _fish_metabolise_and_grow(self) -> None:
+        """Burn each fish's metabolic cost, then invest surplus energy into growth
+        toward its ``adult_size``. Energy is re-capped to the (possibly larger) cap."""
+        cfg = self.cfg
+        fish = self.fish
+        if not len(fish):
+            return
+        size, energy, genes = fish.size, fish.energy, fish.genes
+        speed = np.sqrt(np.einsum("nc,nc->n", fish.vel, fish.vel))
+        energy -= metabolism(size, speed, genes[:, F_PERC], cfg)
+
+        cap = energy_cap_of(size, cfg)
+        adult = genes[:, F_ADULT]
+        grow = (energy >= cfg.growth_surplus_frac * cap) & (size < adult)
+        ds = np.where(grow, np.minimum(cfg.growth_speed, adult - size), 0.0)
+        # Growing a body of area size² by ds costs energy per unit mass gained;
+        # d(size²) ≈ 2·size·ds.
+        energy -= cfg.growth_cost_k * (2.0 * size * ds)
+        size += ds
+        np.minimum(energy, energy_cap_of(size, cfg), out=energy)
+        # Growth lowers a fish's top speed (bigger = slower); re-clamp so it never
+        # ends the tick moving faster than its new size allows.
+        if grow.any():
+            fish.vel[:] = limit_norm(fish.vel, max_speed_of(size, cfg))
+
+    def _fish_starve(self) -> None:
+        """Cull fish whose energy has run out."""
+        fish = self.fish
+        if not len(fish):
+            return
+        starved = fish.compact(fish.energy > 0)
+        self.deaths += starved
+        self.starvations += starved
 
     # --- World geometry: walls and edges -------------------------------------
 
@@ -388,8 +626,8 @@ class Simulation:
         positional ejection back out. Sharks need that ejection because their
         velocity is rewritten from scratch each tick, so a nudge alone would be
         forgotten — they'd end up sliding along a wall instead. Pass ``max_speed``
-        (per animal) to re-clamp nudged rows; fish keep their gene's speed cap
-        intact, sharks are left unclamped like the rest of their motion.
+        (per animal) to re-clamp nudged rows; fish keep their speed cap intact,
+        sharks are left unclamped like the rest of their motion.
         """
         cfg = self.cfg
         if not cfg.walls_enabled or not len(state):
@@ -430,15 +668,21 @@ class Simulation:
     # --- HUD statistics -----------------------------------------------------
 
     def _update_stats(self) -> None:
+        fish = self.fish
+        alive = len(fish) > 0
         stats: dict[str, float] = {
-            "population": len(self.fish),
+            "population": len(fish),
             "births": self.births,
             "deaths": self.deaths,
+            "starvations": self.starvations,
             "shark_population": len(self.sharks),
             "shark_births": self.shark_births,
             "shark_deaths": self.shark_deaths,
+            "food_count": len(self.food),
+            "fish_size": float(fish.size.mean()) if alive else 0.0,
+            "fish_energy": float(fish.energy.mean()) if alive else 0.0,
         }
-        self._average_genes(stats, self.fish, GENE_NAMES, prefix="", lineage="generation")
+        self._average_genes(stats, fish, GENE_NAMES, prefix="", lineage="generation")
         self._average_genes(
             stats, self.sharks, SHARK_GENE_NAMES, prefix="shark_",
             lineage="shark_generation", energy_key="shark_energy",

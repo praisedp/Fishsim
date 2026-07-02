@@ -38,13 +38,22 @@ def bench(name: str, cfg: Config) -> None:
 
 
 def main() -> None:
-    # Max-load world frozen in place: start at both population caps and disable
-    # every birth/death channel so old and new engines time identical work.
+    # Max-load world frozen in place: populations pinned at their caps and every
+    # birth/death channel disabled, so timings measure identical per-tick work.
+    # Food is filled to its cap but never eaten (eat_radius_k=0), so the food grid,
+    # cross-population query, and food physics all run at full load.
     pinned = Config(
         num_fish=1000,
         num_sharks=50,
-        kill_radius=0.0,
-        repro_prob=0.0,
+        max_pop=1000,
+        max_sharks=50,
+        max_food=400,
+        food_spawn_rate=400.0,  # fills to the cap immediately
+        eat_radius_k=0.0,  # nothing gets eaten -> food count stays pinned
+        kill_radius=0.0,  # no predation deaths
+        metab_basal_k=0.0,  # no fish starvation
+        metab_move_k=0.0,
+        metab_perc_k=0.0,
         shark_metab_base=0.0,
         shark_metab_speed_k=0.0,
         shark_metab_perc_k=0.0,
