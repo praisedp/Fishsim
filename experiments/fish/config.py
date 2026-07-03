@@ -36,7 +36,10 @@ class Config:
     max_pop: int = 1000  # hard cap on living fish (no floor: true ecosystem)
 
     # --- Shark genetic algorithm (energy / hunger driven) ---
-    max_sharks: int = 15  # hard cap on living sharks (no floor: they can go extinct)
+    max_sharks: int = 30  # hard cap on living sharks (no floor: they can go extinct)
+    shark_cull_count: int = (
+        10  # random sharks removed whenever the population hits the cap (0 = off)
+    )
     shark_start_energy: float = 100.0  # energy a fresh/immigrant shark begins with
     shark_energy_per_fish: float = 40.0  # energy gained per fish eaten
     shark_repro_energy: float = 250.0  # energy needed to spawn a child
@@ -53,8 +56,8 @@ class Config:
     # keeps a hall-of-fame of the best shark (genes, brain) snapshots seen so far;
     # a rescue clones sharks back from it — on demand ([B] key) and automatically
     # whenever the population hits zero — so evolved policies aren't lost.
-    rescue_count: int = 8  # sharks spawned by a manual ([B]) rescue
-    min_sharks: int = 8  # auto-floor: repopulate to this when sharks go extinct
+    rescue_count: int = 10  # sharks spawned by a manual ([B]) rescue
+    min_sharks: int = 10  # auto-floor: repopulate to this when sharks go extinct
     hof_size: int = 12  # how many elite (genes, brain) snapshots to retain
     hof_age_weight: float = 0.05  # age's weight in score = energy + w*age
     rescue_mut_scale: float = (

@@ -13,6 +13,7 @@ from pygame.math import Vector2
 from brain import (
     N_INPUTS,
     N_SECTORS,
+    WEIGHT_COUNT,
     forward,
     mutate_brains,
     random_brains,
@@ -217,7 +218,7 @@ def test_hall_of_fame_archives_copies_of_best_sharks():
     sim.add_shark((100.0, 100.0), energy=150.0)
     sim._update_hall_of_fame()
     assert len(sim.hall_of_fame) == 1
-    _score, genes, brain = sim.hall_of_fame[0]
+    _score, genes, brain, _generation = sim.hall_of_fame[0]
     # The snapshot is a *copy*: mutating the live shark leaves the archive intact.
     sim.sharks.genes[0] += 1.0
     sim.sharks.brain[0] += 1.0
@@ -238,6 +239,39 @@ def test_rescue_reseeds_learned_brains_after_extinction():
     sim.rescue_sharks(5)
     assert len(sim.sharks) == 5 and sim.shark_births == 5
     assert all(np.array_equal(sim.sharks.brain[k], archived_brain) for k in range(5))
+
+
+def test_rescue_breeds_children_from_two_elites():
+    # Two archived elites with recognisably different genes/brains; mutation off
+    # so every child gene/weight must equal one parent's or the other's.
+    cfg = Config(num_fish=0, num_sharks=0, rescue_mut_scale=0.0)
+    sim = Simulation(cfg, seed=5)
+    lo, hi = SHARK_SPEC.lo.copy(), SHARK_SPEC.hi.copy()
+    sim.add_shark((100.0, 100.0), genes=lo, energy=300.0, weights=np.full(WEIGHT_COUNT, -1.0))
+    sim.add_shark((200.0, 200.0), genes=hi, energy=300.0, weights=np.full(WEIGHT_COUNT, 1.0))
+    sim._update_hall_of_fame()
+    sim.sharks.compact(np.zeros(len(sim.sharks), dtype=bool))  # extinct
+    sim.rescue_sharks(6)
+    assert len(sim.sharks) == 6
+    for k in range(6):
+        assert np.all((sim.sharks.genes[k] == lo) | (sim.sharks.genes[k] == hi))
+        assert np.all(np.abs(sim.sharks.brain[k]) == 1.0)
+    # With enough children and 266 weights, crossover virtually surely mixed
+    # both parents into at least one child (a pure clone has all-equal weights).
+    assert any(
+        len(np.unique(sim.sharks.brain[k])) == 2 for k in range(6)
+    ), "expected at least one child mixing both parents' brains"
+
+
+def test_rescue_children_continue_generation_count():
+    cfg = Config(num_fish=0, num_sharks=0, rescue_mut_scale=0.0)
+    sim = Simulation(cfg, seed=6)
+    sim.add_shark((100.0, 100.0), energy=300.0)
+    sim.sharks.generation[0] = 7  # a deep lineage before the crash
+    sim._update_hall_of_fame()
+    sim.sharks.compact(np.zeros(len(sim.sharks), dtype=bool))  # extinct
+    sim.rescue_sharks(3)
+    assert np.all(sim.sharks.generation == 8)  # children, not gen-0 copies
 
 
 def test_extinct_sharks_auto_respawn_from_hall_of_fame():

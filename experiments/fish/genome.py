@@ -11,8 +11,8 @@ predation and starvation cull the ones that behave badly, so the gene values dri
 toward whatever survives. Fish evolve to evade; sharks evolve to hunt.
 
 The ``*_RANGES`` dicts remain the single source of truth for each species' gene
-bounds. (If two-parent breeding ever returns, vectorized uniform crossover is a
-one-liner: ``np.where(rng.random((k, G)) < 0.5, mother, father)``.)
+bounds. Two-parent breeding exists as :func:`crossover_genes` (uniform
+crossover); the sim uses it when reseeding sharks from the hall-of-fame.
 """
 
 from __future__ import annotations
@@ -122,6 +122,16 @@ def mutate_genes(
     mutated = rng.random(parents.shape) < rate
     noise = rng.normal(0.0, sigma * spec.span, parents.shape)
     return np.clip(parents + mutated * noise, spec.lo, spec.hi)
+
+
+def crossover_genes(
+    rng: np.random.Generator, mothers: np.ndarray, fathers: np.ndarray
+) -> np.ndarray:
+    """Uniform crossover of two aligned parent stacks ``(k, G)``: each child
+    gene comes from its mother or its father with equal odds. Both parents'
+    genes are already in range, so no clamping is needed; callers usually
+    follow with :func:`mutate_genes` for fresh variation."""
+    return np.where(rng.random(mothers.shape) < 0.5, mothers, fathers)
 
 
 def gene_fractions(genes: np.ndarray, spec: GeneSpec, name: str) -> np.ndarray:

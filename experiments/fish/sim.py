@@ -32,6 +32,7 @@ import numpy as np
 from brain import (
     N_INPUTS,
     N_SECTORS,
+    crossover_brains,
     forward,
     mutate_brains,
     random_brains,
@@ -48,6 +49,7 @@ from genome import (
     S_PERC,
     SHARK_GENE_NAMES,
     SHARK_SPEC,
+    crossover_genes,
     mutate_genes,
     random_genes,
 )
@@ -84,9 +86,10 @@ class Simulation:
         self.deaths = 0
         self.shark_births = 0
         self.shark_deaths = 0
-        # Elite (score, genes, brain) snapshots — the best sharks seen so far,
-        # kept so a rescue can reseed learned hunters after an extinction.
-        self.hall_of_fame: list[tuple[float, np.ndarray, np.ndarray]] = []
+        # Elite (score, genes, brain, generation) snapshots — the best sharks
+        # seen so far, kept so a rescue can breed learned hunters back after an
+        # extinction.
+        self.hall_of_fame: list[tuple[float, np.ndarray, np.ndarray, int]] = []
         self.stats: dict[str, float] = {}
         self._update_stats()
 
@@ -197,46 +200,75 @@ class Simulation:
         top = np.argpartition(scores, -k)[-k:]
         for idx in top:
             self.hall_of_fame.append(
-                (float(scores[idx]), sharks.genes[idx].copy(), sharks.brain[idx].copy())
+                (
+                    float(scores[idx]),
+                    sharks.genes[idx].copy(),
+                    sharks.brain[idx].copy(),
+                    int(sharks.generation[idx]),
+                )
             )
         # Keep only the best hof_size overall (best-scoring first).
         self.hall_of_fame.sort(key=lambda e: e[0], reverse=True)
         del self.hall_of_fame[cfg.hof_size:]
 
     def rescue_sharks(self, n: int) -> None:
-        """Spawn up to ``n`` sharks cloned from the hall-of-fame's elites.
+        """Spawn up to ``n`` sharks *bred* from the hall-of-fame's elites.
 
-        Clones get a light mutation (the normal breeding mutation, scaled by
-        ``rescue_mut_scale``) so a rescue reintroduces variation rather than N
-        identical sharks. Falls back to random sharks only if nothing has been
-        archived yet. Never exceeds ``max_sharks``.
+        Each newcomer is a child of two distinct elites (uniform crossover of
+        genes and brain), then mutated as usual (scaled by ``rescue_mut_scale``)
+        — so a rescue continues evolution from the archive instead of replaying
+        identical clones. Its ``generation`` is the older parent's plus one,
+        keeping lineage depth honest across extinctions. With a single archived
+        elite the child degenerates to a mutated clone. Falls back to random
+        sharks only if nothing has been archived yet. Never exceeds
+        ``max_sharks``.
         """
         cfg = self.cfg
         n = min(n, cfg.max_sharks - len(self.sharks))
         if n <= 0:
             return
         if self.hall_of_fame:
-            picks = [self.hall_of_fame[i % len(self.hall_of_fame)] for i in range(n)]
+            hof = self.hall_of_fame
+            mothers = self.rng.integers(0, len(hof), n)
+            fathers = (  # a distinct second parent, when the archive has one
+                mothers if len(hof) == 1
+                else (mothers + self.rng.integers(1, len(hof), n)) % len(hof)
+            )
             genes = mutate_genes(
-                self.rng, SHARK_SPEC, np.stack([p[1] for p in picks]),
+                self.rng, SHARK_SPEC,
+                crossover_genes(
+                    self.rng,
+                    np.stack([hof[i][1] for i in mothers]),
+                    np.stack([hof[i][1] for i in fathers]),
+                ),
                 cfg.shark_mutation_rate * cfg.rescue_mut_scale,
                 cfg.shark_mutation_sigma * cfg.rescue_mut_scale,
             )
             brain = mutate_brains(
-                self.rng, np.stack([p[2] for p in picks]),
+                self.rng,
+                crossover_brains(
+                    self.rng,
+                    np.stack([hof[i][2] for i in mothers]),
+                    np.stack([hof[i][2] for i in fathers]),
+                ),
                 cfg.brain_mutation_rate * cfg.rescue_mut_scale,
                 cfg.brain_mutation_sigma * cfg.rescue_mut_scale,
                 cfg.brain_weight_cap,
             )
+            generation = 1 + np.maximum(
+                np.array([hof[i][3] for i in mothers], dtype=np.int64),
+                np.array([hof[i][3] for i in fathers], dtype=np.int64),
+            )
         else:
             genes = random_genes(self.rng, SHARK_SPEC, n)
             brain = random_brains(self.rng, n, cfg.brain_init_scale)
+            generation = np.zeros(n, dtype=np.int64)
         self.sharks.append(
             pos=self.rng.uniform(0, self.world, (n, 2)),
             vel=self._shark_spawn_vel(genes),
             genes=genes,
             brain=brain,
-            generation=np.zeros(n, dtype=np.int64),
+            generation=generation,
             age=np.zeros(n, dtype=np.int64),
             energy=np.full(n, cfg.shark_start_energy),
         )
@@ -286,6 +318,7 @@ class Simulation:
         # Genetic algorithm: predation feeds sharks, then births and deaths.
         self._predate()
         self._shark_metabolise_and_die()
+        self._shark_random_cull()
         self._shark_reproduce()
         self._fish_reproduce()
         self._update_hall_of_fame()
@@ -427,6 +460,26 @@ class Simulation:
         sharks.energy[:] -= cost
         sharks.age[:] += 1
         self.shark_deaths += sharks.compact(sharks.energy > 0)
+
+    def _shark_random_cull(self) -> None:
+        """When the population sits at the cap, kill ``shark_cull_count`` at random.
+
+        A full population of sharks that are good at staying alive blocks every
+        birth, freezing shark evolution. The victims are drawn *uniformly* — not
+        worst-first — so the cull only opens breeding headroom without adding a
+        selection pressure of its own. Runs just before reproduction, so the
+        freed slots can be filled by well-fed parents on the very same tick.
+        """
+        cfg = self.cfg
+        sharks = self.sharks
+        if cfg.shark_cull_count <= 0 or len(sharks) < cfg.max_sharks:
+            return
+        doomed = self.rng.choice(
+            len(sharks), size=min(cfg.shark_cull_count, len(sharks)), replace=False
+        )
+        keep = np.ones(len(sharks), dtype=bool)
+        keep[doomed] = False
+        self.shark_deaths += sharks.compact(keep)
 
     def _shark_reproduce(self) -> None:
         """Well-fed sharks spawn a mutated child, splitting their energy with it.

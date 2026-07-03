@@ -64,6 +64,21 @@ def mutate_brains(
     return np.clip(parents + mutated * noise, -cap, cap)
 
 
+def crossover_brains(
+    rng: np.random.Generator, mothers: np.ndarray, fathers: np.ndarray
+) -> np.ndarray:
+    """Uniform per-weight crossover of two aligned parent stacks
+    ``(k, WEIGHT_COUNT)``: each child weight comes from either parent with
+    equal odds.
+
+    Mixing weights of two independently evolved nets can break co-adapted
+    structure (the classic competing-conventions problem), so this is used
+    sparingly — only for hall-of-fame rescues, where the elites usually share
+    recent ancestry and the follow-up mutation restores variation anyway.
+    """
+    return np.where(rng.random(mothers.shape) < 0.5, mothers, fathers)
+
+
 # --- Perception and thinking, batched over the whole population ----------------
 
 
