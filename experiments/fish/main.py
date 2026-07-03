@@ -1,8 +1,8 @@
 """Coevolving Boids: a sea of fish and a population of sharks, both evolving.
 
-Fish carry genes for flocking/fleeing; sharks carry genes for hunting (speed, sight,
-predictive lead) and live or die by an energy budget. Watch the predator–prey arms
-race play out in the HUD over a few minutes.
+Fish carry genes for flocking/fleeing; sharks carry body genes (speed range, sight)
+plus a small evolved neural net that steers them, and live or die by an energy
+budget. Watch the predator–prey arms race play out in the HUD over a few minutes.
 
 Run it:  uv run python main.py   (from experiments/fish/)
 
@@ -173,6 +173,8 @@ def main() -> None:
                 elif event.key == pygame.K_o:
                     cfg.walls_enabled = not cfg.walls_enabled
                     sim.rebuild_walls()  # (re)scatter or clear shards
+                elif event.key == pygame.K_b:
+                    sim.rescue_sharks(cfg.rescue_count)  # reseed best sharks
                 elif event.key == pygame.K_r:
                     sim = Simulation(cfg)
 
@@ -221,7 +223,7 @@ def _draw_hud(screen, font, sim, cfg, clock, manual, fish_gene, shark_gene) -> N
     status_line = (
         f"fps:{clock.get_fps():3.0f}  shark:{mode}  edges:{edges}   "
         f"fish=[{fish_gene}] shark=[{shark_gene}]   "
-        f"[M]shark [C]fishcol [K]sharkcol [O]walls [R]reset [W]edges [Space]pause"
+        f"[M]shark [C]fishcol [K]sharkcol [O]walls [B]rescue [R]reset [W]edges [Space]pause"
     )
 
     for i, text in enumerate((fish_line, shark_line, status_line)):

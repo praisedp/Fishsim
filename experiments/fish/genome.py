@@ -32,14 +32,15 @@ GENE_RANGES: dict[str, tuple[float, float]] = {
     "fear": (0.5, 2.0),          # multiplies the base flee radius
 }
 
-# What makes a good hunter. Each gene has a real trade-off so evolution must
-# balance rather than max everything: speed and sight both cost energy per tick
-# (see the metabolism formula in sim.py), and lead just converges to the best
-# interception aim.
+# The shark's *body*; its behaviour lives in an evolved neural net (brain.py)
+# whose throttle output picks a speed between the two speed genes each tick.
+# The bounds here are the hard caps evolution works within. Real trade-offs:
+# actual speed and sight both cost energy per tick (see the metabolism formula
+# in sim.py), so a wide speed band is only worth its price if the brain uses it.
 SHARK_GENE_RANGES: dict[str, tuple[float, float]] = {
-    "max_speed": (3.0, 6.0),      # chase speed; only just faster than fish (top out at 5)
+    "max_speed": (3.0, 6.0),      # top speed; only just faster than fish (top out at 5)
+    "min_speed": (0.5, 3.0),      # cruise floor — the cheapest pace it can hold
     "perception": (80.0, 400.0),  # how far it can spot prey
-    "lead": (0.0, 2.0),           # predictive aim-ahead (intercept) factor
 }
 
 # Order genes appear in the UI / averages. Same as dict order (Python 3.7+).
@@ -91,8 +92,8 @@ F_MAXSPD = FISH_SPEC.col("max_speed")
 F_FEAR = FISH_SPEC.col("fear")
 
 S_MAXSPD = SHARK_SPEC.col("max_speed")
+S_MINSPD = SHARK_SPEC.col("min_speed")
 S_PERC = SHARK_SPEC.col("perception")
-S_LEAD = SHARK_SPEC.col("lead")
 
 
 # --- Population-wide GA operations --------------------------------------------

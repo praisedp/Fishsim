@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from brain import WEIGHT_COUNT
 from genome import FISH_SPEC, SHARK_SPEC
 
 
@@ -99,13 +100,14 @@ class FishState(_SoABase):
 
 class SharkState(_SoABase):
     """The shark population: like fish, plus the energy reserve that predation
-    tops up and metabolism drains."""
+    tops up and metabolism drains, and each shark's neural-net weights."""
 
     def __init__(self, capacity: int):
         super().__init__(capacity, {
             "pos": ((2,), np.float64),
             "vel": ((2,), np.float64),
             "genes": ((SHARK_SPEC.count,), np.float64),
+            "brain": ((WEIGHT_COUNT,), np.float64),
             "generation": ((), np.int64),
             "age": ((), np.int64),
             "energy": ((), np.float64),
@@ -122,6 +124,10 @@ class SharkState(_SoABase):
     @property
     def genes(self) -> np.ndarray:
         return self._view("genes")
+
+    @property
+    def brain(self) -> np.ndarray:
+        return self._view("brain")
 
     @property
     def generation(self) -> np.ndarray:

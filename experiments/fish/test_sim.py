@@ -10,6 +10,14 @@ import math
 import numpy as np
 from pygame.math import Vector2
 
+from brain import (
+    N_INPUTS,
+    N_SECTORS,
+    forward,
+    mutate_brains,
+    random_brains,
+    sector_retina,
+)
 from config import Config
 from genome import (
     F_FEAR,
@@ -21,6 +29,9 @@ from genome import (
     F_WSEP,
     FISH_SPEC,
     GENE_RANGES,
+    S_MAXSPD,
+    S_MINSPD,
+    S_PERC,
     SHARK_SPEC,
     gene_fractions,
     mutate_genes,
@@ -200,6 +211,56 @@ def test_shark_population_respects_cap():
     assert len(sim.sharks) <= cfg.max_sharks
 
 
+def test_hall_of_fame_archives_copies_of_best_sharks():
+    cfg = Config(num_fish=0, num_sharks=0)
+    sim = Simulation(cfg, seed=1)
+    sim.add_shark((100.0, 100.0), energy=150.0)
+    sim._update_hall_of_fame()
+    assert len(sim.hall_of_fame) == 1
+    _score, genes, brain = sim.hall_of_fame[0]
+    # The snapshot is a *copy*: mutating the live shark leaves the archive intact.
+    sim.sharks.genes[0] += 1.0
+    sim.sharks.brain[0] += 1.0
+    assert not np.array_equal(genes, sim.sharks.genes[0])
+    assert not np.array_equal(brain, sim.sharks.brain[0])
+
+
+def test_rescue_reseeds_learned_brains_after_extinction():
+    # rescue_mut_scale=0 makes clones exact, so we can prove a rescue restores the
+    # archived elite's brain rather than fresh random noise.
+    cfg = Config(num_fish=0, num_sharks=0, rescue_mut_scale=0.0)
+    sim = Simulation(cfg, seed=2)
+    sim.add_shark((100.0, 100.0), energy=300.0)
+    sim._update_hall_of_fame()  # archive the well-fed shark's brain
+    archived_brain = sim.hall_of_fame[0][2].copy()
+    sim.sharks.compact(np.zeros(len(sim.sharks), dtype=bool))  # wipe them out
+    assert len(sim.sharks) == 0
+    sim.rescue_sharks(5)
+    assert len(sim.sharks) == 5 and sim.shark_births == 5
+    assert all(np.array_equal(sim.sharks.brain[k], archived_brain) for k in range(5))
+
+
+def test_extinct_sharks_auto_respawn_from_hall_of_fame():
+    cfg = Config(num_fish=0, num_sharks=0, min_sharks=6)
+    sim = Simulation(cfg, seed=3)
+    sim.add_shark((100.0, 100.0), energy=150.0)
+    sim._update_hall_of_fame()  # something to reseed from
+    sim.sharks.compact(np.zeros(len(sim.sharks), dtype=bool))  # extinct
+    assert len(sim.sharks) == 0
+    sim.step()  # auto-floor fires at the top of the tick
+    assert len(sim.sharks) == cfg.min_sharks
+
+
+def test_rescue_on_empty_hall_of_fame_uses_random_and_respects_cap():
+    cfg = Config(num_fish=0, num_sharks=0, max_sharks=5)
+    sim = Simulation(cfg, seed=4)
+    assert not sim.hall_of_fame  # nothing archived yet
+    sim.rescue_sharks(100)  # asks for far more than the cap allows
+    assert len(sim.sharks) == cfg.max_sharks  # clamped to headroom, no crash
+    assert np.all(sim.sharks.genes >= SHARK_SPEC.lo)
+    assert np.all(sim.sharks.genes <= SHARK_SPEC.hi)
+
+
 def test_ecosystem_runs_within_invariants():
     cfg = Config(num_fish=60, num_sharks=5, width=600, height=400)
     sim = Simulation(cfg, seed=5)
@@ -207,6 +268,151 @@ def test_ecosystem_runs_within_invariants():
         sim.step()  # fully autonomous
         assert 0 <= len(sim.fish) <= cfg.max_pop
         assert 0 <= len(sim.sharks) <= cfg.max_sharks
+
+
+# --- Shark brains -------------------------------------------------------------
+
+
+def test_brain_forward_shapes_bounds_and_determinism():
+    rng = np.random.default_rng(0)
+    brains = random_brains(rng, 6, 0.8)
+    obs = rng.uniform(0.0, 1.0, (6, N_INPUTS))
+    turn, throttle = forward(brains, obs)
+    assert turn.shape == (6,) and throttle.shape == (6,)
+    assert np.all(np.abs(turn) <= 1.0)
+    assert np.all((throttle >= 0.0) & (throttle <= 1.0))
+    turn2, throttle2 = forward(brains, obs)
+    assert np.array_equal(turn, turn2) and np.array_equal(throttle, throttle2)
+
+
+def _oracle_retina(shark_pos, headings, fish_pos, perception, count_norm):
+    """Scalar reference for the sector retina — one shark, one fish at a time."""
+    out = np.zeros((len(shark_pos), 2 * N_SECTORS))
+    for a in range(len(shark_pos)):
+        nearest = [math.inf] * N_SECTORS
+        count = [0] * N_SECTORS
+        facing = math.atan2(headings[a, 1], headings[a, 0])
+        for f in range(len(fish_pos)):
+            dx = fish_pos[f, 0] - shark_pos[a, 0]
+            dy = fish_pos[f, 1] - shark_pos[a, 1]
+            if dx * dx + dy * dy > perception[a] ** 2:
+                continue
+            rel = math.atan2(dy, dx) - facing
+            k = min(
+                int(((rel + math.pi) % (2 * math.pi)) / (2 * math.pi) * N_SECTORS),
+                N_SECTORS - 1,
+            )
+            count[k] += 1
+            nearest[k] = min(nearest[k], math.hypot(dx, dy))
+        for k in range(N_SECTORS):
+            if count[k]:
+                out[a, k] = max(0.0, 1.0 - nearest[k] / perception[a])
+            out[a, N_SECTORS + k] = min(count[k] / count_norm, 1.0)
+    return out
+
+
+def test_sector_retina_matches_scalar_reference():
+    rng = np.random.default_rng(11)
+    shark_pos = rng.uniform(0, (600.0, 400.0), (9, 2))
+    fish_pos = rng.uniform(0, (600.0, 400.0), (120, 2))
+    angle = rng.uniform(0, 2 * math.pi, 9)
+    headings = np.stack([np.cos(angle), np.sin(angle)], axis=1)
+    perception = rng.uniform(80.0, 400.0, 9)
+    delta = fish_pos[None, :, :] - shark_pos[:, None, :]
+    d2 = np.einsum("sfc,sfc->sf", delta, delta)
+    retina = sector_retina(delta, d2, headings, perception, count_norm=8.0)
+    oracle = _oracle_retina(shark_pos, headings, fish_pos, perception, 8.0)
+    assert np.allclose(retina, oracle, atol=1e-9)
+
+
+def test_sector_retina_empty_cases():
+    # No fish: all zeros. No sharks: an empty but well-shaped result.
+    no_fish = sector_retina(
+        np.empty((3, 0, 2)), np.empty((3, 0)), np.tile((1.0, 0.0), (3, 1)),
+        np.full(3, 200.0), count_norm=8.0,
+    )
+    assert no_fish.shape == (3, 2 * N_SECTORS) and not no_fish.any()
+    no_sharks = sector_retina(
+        np.empty((0, 5, 2)), np.empty((0, 5)), np.empty((0, 2)),
+        np.empty(0), count_norm=8.0,
+    )
+    assert no_sharks.shape == (0, 2 * N_SECTORS)
+
+
+def test_brain_mutation_identity_and_clamp():
+    rng = np.random.default_rng(2)
+    parents = random_brains(rng, 40, 0.8)
+    assert np.array_equal(mutate_brains(rng, parents, 0.0, 0.5, 2.0), parents)
+    children = mutate_brains(rng, parents, 1.0, 10.0, 2.0)
+    assert np.all(np.abs(children) <= 2.0)
+    assert not np.array_equal(children, parents)
+
+
+def test_shark_speed_stays_between_its_speed_genes():
+    cfg = Config(num_fish=40, num_sharks=8, width=600, height=400)
+    sim = Simulation(cfg, seed=8)
+    for _ in range(100):
+        sim.step()
+        if not len(sim.sharks):
+            break
+        genes = sim.sharks.genes
+        speeds = _speeds(sim.sharks.vel)
+        low = np.minimum(genes[:, S_MINSPD], genes[:, S_MAXSPD])
+        assert np.all(speeds >= low - 1e-9)
+        assert np.all(speeds <= genes[:, S_MAXSPD] + 1e-9)
+
+
+def test_speed_band_collapses_when_genes_meet():
+    cfg = Config(num_fish=0, num_sharks=0)
+    sim = Simulation(cfg, seed=3)
+    genes = SHARK_SPEC.mid()
+    genes[S_MINSPD] = 3.0  # top of the min range...
+    genes[S_MAXSPD] = 3.0  # ...meets the bottom of the max range: a fixed pace
+    sim.add_shark((100.0, 100.0), genes=genes)
+    for _ in range(5):
+        sim.step()
+        assert np.allclose(_speeds(sim.sharks.vel), 3.0)
+
+
+def test_shark_metabolism_charges_for_actual_speed():
+    cfg = Config(num_fish=0, num_sharks=0)
+    sim = Simulation(cfg, seed=1)
+    sim.add_shark((100.0, 100.0), energy=50.0)
+    sim.add_shark((300.0, 300.0), energy=50.0)
+    sim.sharks.vel[0] = (1.0, 0.0)
+    sim.sharks.vel[1] = (4.0, 0.0)
+    perc = sim.sharks.genes[:, S_PERC].copy()
+    sim._shark_metabolise_and_die()
+    expected = (
+        cfg.shark_metab_base
+        + cfg.shark_metab_speed_k * np.array([1.0, 16.0])
+        + cfg.shark_metab_perc_k * perc
+    )
+    assert np.allclose(sim.sharks.energy, 50.0 - expected)
+    assert sim.sharks.energy[1] < sim.sharks.energy[0]  # sprinting costs more
+
+
+def test_manual_target_overrides_the_nearest_sharks_brain():
+    cfg = Config(num_fish=0, num_sharks=0)
+    sim = Simulation(cfg, seed=4)
+    sim.add_shark((100.0, 100.0))
+    start = sim.sharks.pos[0].copy()
+    sim.step((500.0, 100.0))
+    moved = sim.sharks.pos[0] - start
+    assert moved[0] > 0 and abs(moved[1]) < 1e-9  # straight toward the cursor
+    assert np.isclose(_speeds(sim.sharks.vel)[0], sim.sharks.genes[0, S_MAXSPD])
+
+
+def test_random_brained_sharks_still_eventually_eat():
+    # Dense fish soup: even founder sharks with random brains must blunder into
+    # prey well within the tick budget, or the hunting pipeline is broken.
+    cfg = Config(num_fish=400, num_sharks=8, width=600, height=400)
+    sim = Simulation(cfg, seed=0)
+    for _ in range(600):
+        sim.step()
+        if sim.deaths:
+            break
+    assert sim.deaths > 0
 
 
 # --- Wall obstacles ---------------------------------------------------------

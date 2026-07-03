@@ -2,11 +2,12 @@
 
 This is the genetic-algorithm engine for *both* species. Each tick:
 
-- **Sharks hunt** the nearest fish they can see (limited by their ``perception``
-  gene), aiming at a predicted intercept (their ``lead`` gene) and chasing at their
-  ``max_speed`` gene. Eating a fish restores energy; every tick burns some
-  (faster/keener-sighted sharks burn more). Out of energy → the shark starves and
-  dies; well-fed → it spawns a mutated child, splitting its energy.
+- **Sharks hunt** by brain: each runs its own evolved neural net (:mod:`brain`)
+  over a sector retina of the fish it can see (limited by its ``perception``
+  gene) and picks a turn and a speed between its ``min_speed`` and ``max_speed``
+  genes. Eating a fish restores energy; every tick burns some (sprinting and
+  keen sight burn more). Out of energy → the shark starves and dies; well-fed →
+  it spawns a mutated child (genes and brain), splitting its energy.
 - **Fish flee** the nearest shark and flock, then mature ones occasionally breed
   mutated copies of themselves.
 
@@ -28,14 +29,22 @@ from __future__ import annotations
 
 import numpy as np
 
+from brain import (
+    N_INPUTS,
+    N_SECTORS,
+    forward,
+    mutate_brains,
+    random_brains,
+    sector_retina,
+)
 from config import Config
 from genome import (
     F_MAXSPD,
     F_PERC,
     FISH_SPEC,
     GENE_NAMES,
-    S_LEAD,
     S_MAXSPD,
+    S_MINSPD,
     S_PERC,
     SHARK_GENE_NAMES,
     SHARK_SPEC,
@@ -48,8 +57,6 @@ from steering import EPS, fish_accelerations, limit_norm
 from walls import WallField, avoid_all
 
 # Behaviour constants (fixed by design, not evolved or config-tuned).
-WANDER_TURN_DEG = 20.0  # max random heading change per tick while roaming
-WANDER_AHEAD = 50.0  # how far ahead of a roaming shark its target sits
 SHARK_SPAWN_JITTER = 10.0  # newborn shark's offset from its parent
 FISH_SPAWN_JITTER = 8.0  # newborn fish's offset from its parent
 
@@ -77,6 +84,9 @@ class Simulation:
         self.deaths = 0
         self.shark_births = 0
         self.shark_deaths = 0
+        # Elite (score, genes, brain) snapshots — the best sharks seen so far,
+        # kept so a rescue can reseed learned hunters after an extinction.
+        self.hall_of_fame: list[tuple[float, np.ndarray, np.ndarray]] = []
         self.stats: dict[str, float] = {}
         self._update_stats()
 
@@ -107,10 +117,12 @@ class Simulation:
         )
 
         s = cfg.num_sharks
+        shark_genes = random_genes(self.rng, SHARK_SPEC, s)
         self.sharks.append(
             pos=self.rng.uniform(0, self.world, (s, 2)),
-            vel=np.zeros((s, 2)),
-            genes=random_genes(self.rng, SHARK_SPEC, s),
+            vel=self._shark_spawn_vel(shark_genes),
+            genes=shark_genes,
+            brain=random_brains(self.rng, s, cfg.brain_init_scale),
             generation=np.zeros(s, dtype=np.int64),
             age=np.zeros(s, dtype=np.int64),
             energy=np.full(s, cfg.shark_start_energy),
@@ -121,6 +133,14 @@ class Simulation:
         each fish's own top speed."""
         angle = self.rng.uniform(0, 2 * np.pi, len(max_speeds))
         speed = self.rng.uniform(self.cfg.min_speed, max_speeds)
+        return np.stack([np.cos(angle), np.sin(angle)], axis=1) * speed[:, None]
+
+    def _shark_spawn_vel(self, genes: np.ndarray) -> np.ndarray:
+        """``(k, 2)`` newborn-shark velocities: random headings at each shark's
+        cruise floor, so a fresh shark's heading (its retina frame) is defined
+        and diverse from tick one instead of every newborn facing +x."""
+        angle = self.rng.uniform(0, 2 * np.pi, len(genes))
+        speed = np.minimum(genes[:, S_MINSPD], genes[:, S_MAXSPD])
         return np.stack([np.cos(angle), np.sin(angle)], axis=1) * speed[:, None]
 
     def add_fish(self, pos, genes=None, vel=None, age: int = 0, generation: int = 0) -> None:
@@ -139,17 +159,88 @@ class Simulation:
             age=np.array([age]),
         )
 
-    def add_shark(self, pos, genes=None, energy: float | None = None) -> None:
-        """Insert a single shark (mid-range genes by default) — mainly for tests."""
+    def add_shark(self, pos, genes=None, energy: float | None = None, weights=None) -> None:
+        """Insert a single shark (mid-range genes, random brain by default) —
+        mainly for tests."""
         genes = SHARK_SPEC.mid() if genes is None else np.asarray(genes, dtype=float)
+        weights = (
+            random_brains(self.rng, 1, self.cfg.brain_init_scale)
+            if weights is None
+            else np.asarray(weights, dtype=float)[None]
+        )
         self.sharks.append(
             pos=np.asarray(pos, dtype=float)[None],
-            vel=np.zeros((1, 2)),
+            vel=self._shark_spawn_vel(genes[None]),
             genes=genes[None],
+            brain=weights,
             generation=np.zeros(1, dtype=np.int64),
             age=np.zeros(1, dtype=np.int64),
             energy=np.array([self.cfg.shark_start_energy if energy is None else energy]),
         )
+
+    # --- Hall of fame & rescue ---------------------------------------------
+
+    def _update_hall_of_fame(self) -> None:
+        """Snapshot this tick's best live sharks into the hall-of-fame.
+
+        Score is ``energy + hof_age_weight * age`` — a shark that's both well-fed
+        (it can hunt) and long-lived (it survived). Snapshots are *copies*, since
+        the SoA rows get overwritten as the population is compacted and reused.
+        Runs every tick so elites are archived while alive, not lost to starvation.
+        """
+        sharks = self.sharks
+        if not len(sharks):
+            return
+        cfg = self.cfg
+        scores = sharks.energy + cfg.hof_age_weight * sharks.age
+        k = min(cfg.hof_size, len(sharks))
+        top = np.argpartition(scores, -k)[-k:]
+        for idx in top:
+            self.hall_of_fame.append(
+                (float(scores[idx]), sharks.genes[idx].copy(), sharks.brain[idx].copy())
+            )
+        # Keep only the best hof_size overall (best-scoring first).
+        self.hall_of_fame.sort(key=lambda e: e[0], reverse=True)
+        del self.hall_of_fame[cfg.hof_size:]
+
+    def rescue_sharks(self, n: int) -> None:
+        """Spawn up to ``n`` sharks cloned from the hall-of-fame's elites.
+
+        Clones get a light mutation (the normal breeding mutation, scaled by
+        ``rescue_mut_scale``) so a rescue reintroduces variation rather than N
+        identical sharks. Falls back to random sharks only if nothing has been
+        archived yet. Never exceeds ``max_sharks``.
+        """
+        cfg = self.cfg
+        n = min(n, cfg.max_sharks - len(self.sharks))
+        if n <= 0:
+            return
+        if self.hall_of_fame:
+            picks = [self.hall_of_fame[i % len(self.hall_of_fame)] for i in range(n)]
+            genes = mutate_genes(
+                self.rng, SHARK_SPEC, np.stack([p[1] for p in picks]),
+                cfg.shark_mutation_rate * cfg.rescue_mut_scale,
+                cfg.shark_mutation_sigma * cfg.rescue_mut_scale,
+            )
+            brain = mutate_brains(
+                self.rng, np.stack([p[2] for p in picks]),
+                cfg.brain_mutation_rate * cfg.rescue_mut_scale,
+                cfg.brain_mutation_sigma * cfg.rescue_mut_scale,
+                cfg.brain_weight_cap,
+            )
+        else:
+            genes = random_genes(self.rng, SHARK_SPEC, n)
+            brain = random_brains(self.rng, n, cfg.brain_init_scale)
+        self.sharks.append(
+            pos=self.rng.uniform(0, self.world, (n, 2)),
+            vel=self._shark_spawn_vel(genes),
+            genes=genes,
+            brain=brain,
+            generation=np.zeros(n, dtype=np.int64),
+            age=np.zeros(n, dtype=np.int64),
+            energy=np.full(n, cfg.shark_start_energy),
+        )
+        self.shark_births += n
 
     # --- One simulation tick -----------------------------------------------
 
@@ -161,14 +252,14 @@ class Simulation:
         """
         cfg = self.cfg
 
+        # Auto-floor: if the sharks went extinct last tick, reseed a few from the
+        # hall-of-fame before the world runs, so their learned brains carry on.
+        if not len(self.sharks) and self.hall_of_fame:
+            self.rescue_sharks(cfg.min_sharks)
+
         # Sharks move first so fish react to their new positions.
         if len(self.sharks):
-            targets = self._shark_targets(manual_target)
-            vel = limit_norm(targets - self.sharks.pos, self.sharks.genes[:, S_MAXSPD])
-            self.sharks.vel[:] = vel
-            self.sharks.pos[:] += vel
-            self._confine_sharks()
-            self._apply_walls(self.sharks)
+            self._update_sharks(manual_target)
 
         # Fish pass 1 (read): flock with visible neighbours, flee the nearest shark.
         if len(self.fish):
@@ -197,62 +288,93 @@ class Simulation:
         self._shark_metabolise_and_die()
         self._shark_reproduce()
         self._fish_reproduce()
+        self._update_hall_of_fame()
         self._update_stats()
 
-    # --- Shark targeting ----------------------------------------------------
+    # --- Shark brains -------------------------------------------------------
 
-    def _shark_targets(self, manual_target) -> np.ndarray:
-        """Where each shark aims ``(S, 2)``: a predicted intercept of the nearest
-        visible fish, a gentle wander when nothing is in sight (still burning
-        energy), or the mouse for the manually driven shark."""
+    def _update_sharks(self, manual_target) -> None:
+        """One motion tick for every shark: sense → think → move.
+
+        Each shark's own neural net turns its observation into a heading change
+        (capped at ``shark_max_turn``) and a speed between its ``min_speed`` and
+        ``max_speed`` genes. The mouse (``manual_target``) overrides the nearest
+        shark's brain for the tick, steering it at the cursor at full speed.
+        """
         cfg = self.cfg
-        sharks, fish = self.sharks, self.fish
-        targets = self._wander_targets()
+        sharks = self.sharks
+        headings = self._shark_headings()
+        turn, throttle = forward(sharks.brain, self._shark_observe(headings))
 
-        if len(fish):
-            delta = fish.pos[None, :, :] - sharks.pos[:, None, :]  # (S, F, 2)
-            if cfg.wrap_edges:
-                delta = min_image(delta, self.world)
-            d2 = np.einsum("sfc,sfc->sf", delta, delta)
-            visible = d2 <= sharks.genes[:, S_PERC, None] ** 2
-            prey = np.where(visible, d2, np.inf).argmin(axis=1)
-            hunters = np.flatnonzero(visible.any(axis=1))
-            if hunters.size:
-                caught = prey[hunters]
-                dist = np.sqrt(d2[hunters, caught])
-                # Lead the target: aim where it will be by the time we could
-                # reach it. Built from the shark's own frame (the min-imaged
-                # delta) so the intercept also works across the wrap seam.
-                lead_time = (
-                    sharks.genes[hunters, S_LEAD]
-                    * dist
-                    / np.maximum(sharks.genes[hunters, S_MAXSPD], EPS)
-                )
-                targets[hunters] = (
-                    sharks.pos[hunters]
-                    + delta[hunters, caught]
-                    + fish.vel[caught] * lead_time[:, None]
-                )
+        theta = np.arctan2(headings[:, 1], headings[:, 0]) + turn * cfg.shark_max_turn
+        min_speed = np.minimum(sharks.genes[:, S_MINSPD], sharks.genes[:, S_MAXSPD])
+        speed = min_speed + throttle * (sharks.genes[:, S_MAXSPD] - min_speed)
+        vel = np.stack([np.cos(theta), np.sin(theta)], axis=1) * speed[:, None]
 
         if manual_target is not None:
             # The mouse drives the shark nearest to it (plain screen distance).
             offset = np.asarray(manual_target, dtype=float) - sharks.pos
             nearest = np.einsum("sc,sc->s", offset, offset).argmin()
-            targets[nearest] = manual_target
-        return targets
+            vel[nearest] = limit_norm(
+                offset[nearest][None], sharks.genes[nearest, S_MAXSPD]
+            )[0]
 
-    def _wander_targets(self) -> np.ndarray:
-        """A point ahead of each shark with a small random turn (roaming search);
-        a standing-still shark picks a fresh random direction."""
-        sharks = self.sharks
-        s = len(sharks)
-        speed2 = np.einsum("sc,sc->s", sharks.vel, sharks.vel)
-        turn = np.radians(self.rng.uniform(-WANDER_TURN_DEG, WANDER_TURN_DEG, s))
-        current = np.arctan2(sharks.vel[:, 1], sharks.vel[:, 0])
-        fresh = self.rng.uniform(0, 2 * np.pi, s)
-        angle = np.where(speed2 < EPS, fresh, current + turn)
-        heading = np.stack([np.cos(angle), np.sin(angle)], axis=1)
-        return sharks.pos + heading * WANDER_AHEAD
+        sharks.vel[:] = vel
+        sharks.pos[:] += vel
+        self._confine_sharks()
+        self._apply_walls(self.sharks)
+
+    def _shark_headings(self) -> np.ndarray:
+        """``(S, 2)`` unit facing per shark; a (rare) motionless shark faces +x.
+        Newborns spawn already moving, so the fallback only covers edge cases
+        like a wall push exactly cancelling a shark's velocity."""
+        vel = self.sharks.vel
+        speed = np.sqrt(np.einsum("sc,sc->s", vel, vel))
+        return np.where(
+            speed[:, None] > EPS, vel / np.maximum(speed, EPS)[:, None], (1.0, 0.0)
+        )
+
+    def _shark_observe(self, headings: np.ndarray) -> np.ndarray:
+        """``(S, N_INPUTS)`` observations: the sector retina, then body senses —
+        energy (1.0 = ready to breed), speed (fraction of own top speed),
+        obstacle proximity, and a constant bias. Everything is bounded so no
+        input can dwarf the rest of an evolved network."""
+        cfg = self.cfg
+        sharks, fish = self.sharks, self.fish
+        obs = np.zeros((len(sharks), N_INPUTS))
+        if len(fish):
+            delta = fish.pos[None, :, :] - sharks.pos[:, None, :]  # (S, F, 2)
+            if cfg.wrap_edges:
+                delta = min_image(delta, self.world)
+            d2 = np.einsum("sfc,sfc->sf", delta, delta)
+            obs[:, : 2 * N_SECTORS] = sector_retina(
+                delta, d2, headings, sharks.genes[:, S_PERC], cfg.retina_count_norm
+            )
+        speed = np.sqrt(np.einsum("sc,sc->s", sharks.vel, sharks.vel))
+        obs[:, 2 * N_SECTORS] = np.clip(sharks.energy / cfg.shark_repro_energy, 0.0, 1.0)
+        obs[:, 2 * N_SECTORS + 1] = np.clip(speed / sharks.genes[:, S_MAXSPD], 0.0, 1.0)
+        obs[:, 2 * N_SECTORS + 2] = self._shark_obstacle_signal()
+        obs[:, 2 * N_SECTORS + 3] = 1.0
+        return obs
+
+    def _shark_obstacle_signal(self) -> np.ndarray:
+        """``(S,)`` in 0–1: how hard the world pushes back where the shark is.
+
+        The slot keeps one meaning across every mode so evolved brains transfer:
+        0 everywhere in the default wrap-and-no-walls world, rising near a border
+        in bounce mode and near a shard face when walls are on (reusing the same
+        ``avoid_all`` response the motion pass applies)."""
+        cfg = self.cfg
+        pos = self.sharks.pos
+        signal = np.zeros(len(pos))
+        if not cfg.wrap_edges:
+            border = np.minimum(pos, self.world - pos).min(axis=1)
+            signal = np.clip(1.0 - border / cfg.edge_margin, 0.0, 1.0)
+        if cfg.walls_enabled:
+            push, _eject = avoid_all(pos, self.walls, cfg.wall_margin)
+            push_norm = np.sqrt(np.einsum("sc,sc->s", push, push))
+            signal = np.maximum(signal, np.minimum(push_norm, 1.0))
+        return signal
 
     # --- Genetic algorithm: death, birth, energy ---------------------------
 
@@ -287,14 +409,19 @@ class Simulation:
             self.deaths += fish.compact(~eaten)
 
     def _shark_metabolise_and_die(self) -> None:
-        """Burn each shark's per-tick energy cost; cull any that hit zero."""
+        """Burn each shark's per-tick energy cost; cull any that hit zero.
+
+        The speed term is quadratic in the speed *actually swum* this tick, not
+        the max_speed gene — so the brain's throttle output faces a real bill:
+        cruising is cheap, sprinting costs, and bursting only when closing on
+        prey is what evolution should reward."""
         cfg = self.cfg
         sharks = self.sharks
         if not len(sharks):
             return
         cost = (
             cfg.shark_metab_base
-            + cfg.shark_metab_speed_k * sharks.genes[:, S_MAXSPD]
+            + cfg.shark_metab_speed_k * np.einsum("sc,sc->s", sharks.vel, sharks.vel)
             + cfg.shark_metab_perc_k * sharks.genes[:, S_PERC]
         )
         sharks.energy[:] -= cost
@@ -322,12 +449,18 @@ class Simulation:
         child_energy = sharks.energy[parents] / 2 - cfg.shark_birth_cost
         sharks.energy[parents] /= 2
         jitter = self.rng.uniform(-SHARK_SPAWN_JITTER, SHARK_SPAWN_JITTER, (k, 2))
+        child_genes = mutate_genes(
+            self.rng, SHARK_SPEC, sharks.genes[parents],
+            cfg.shark_mutation_rate, cfg.shark_mutation_sigma,
+        )
         self.sharks.append(
             pos=sharks.pos[parents] + jitter,
-            vel=np.zeros((k, 2)),
-            genes=mutate_genes(
-                self.rng, SHARK_SPEC, sharks.genes[parents],
-                cfg.shark_mutation_rate, cfg.shark_mutation_sigma,
+            vel=self._shark_spawn_vel(child_genes),
+            genes=child_genes,
+            brain=mutate_brains(
+                self.rng, sharks.brain[parents],
+                cfg.brain_mutation_rate, cfg.brain_mutation_sigma,
+                cfg.brain_weight_cap,
             ),
             generation=sharks.generation[parents] + 1,
             age=np.zeros(k, dtype=np.int64),
