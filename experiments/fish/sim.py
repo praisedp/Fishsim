@@ -30,8 +30,9 @@ from __future__ import annotations
 import numpy as np
 
 from brain import (
-    N_INPUTS,
     N_SECTORS,
+    N_SENSES,
+    BrainSpec,
     crossover_brains,
     forward,
     mutate_brains,
@@ -78,7 +79,14 @@ class Simulation:
         self.rebuild_walls()
 
         self.fish = FishState(capacity=max(cfg.max_pop, cfg.num_fish))
-        self.sharks = SharkState(capacity=max(cfg.max_sharks, cfg.num_sharks))
+        # One brain layout per sim, derived from config — it sizes the shark
+        # state's weight buffer and the observation every net is run on.
+        self.brain_spec = BrainSpec(cfg.shark_memory_frames, cfg.shark_hidden)
+        self.sharks = SharkState(
+            capacity=max(cfg.max_sharks, cfg.num_sharks),
+            weight_count=self.brain_spec.weight_count,
+            memory_frames=cfg.shark_memory_frames,
+        )
         self._spawn_initial_populations()
 
         # Lifetime tallies + a per-step snapshot for the HUD.
@@ -125,11 +133,19 @@ class Simulation:
             pos=self.rng.uniform(0, self.world, (s, 2)),
             vel=self._shark_spawn_vel(shark_genes),
             genes=shark_genes,
-            brain=random_brains(self.rng, s, cfg.brain_init_scale),
+            brain=random_brains(
+                self.rng, s, cfg.brain_init_scale, self.brain_spec.weight_count
+            ),
+            memory=self._blank_memory(s),
             generation=np.zeros(s, dtype=np.int64),
             age=np.zeros(s, dtype=np.int64),
             energy=np.full(s, cfg.shark_start_energy),
         )
+
+    def _blank_memory(self, k: int) -> np.ndarray:
+        """``(k, memory_frames, N_SENSES)`` zeroed frame stacks — every newborn
+        starts blind to the past ("saw nothing before")."""
+        return np.zeros((k, self.cfg.shark_memory_frames, N_SENSES))
 
     def _random_headings(self, max_speeds: np.ndarray) -> np.ndarray:
         """``(k, 2)`` velocities: random directions, speeds between the floor and
@@ -167,7 +183,9 @@ class Simulation:
         mainly for tests."""
         genes = SHARK_SPEC.mid() if genes is None else np.asarray(genes, dtype=float)
         weights = (
-            random_brains(self.rng, 1, self.cfg.brain_init_scale)
+            random_brains(
+                self.rng, 1, self.cfg.brain_init_scale, self.brain_spec.weight_count
+            )
             if weights is None
             else np.asarray(weights, dtype=float)[None]
         )
@@ -176,6 +194,7 @@ class Simulation:
             vel=self._shark_spawn_vel(genes[None]),
             genes=genes[None],
             brain=weights,
+            memory=self._blank_memory(1),
             generation=np.zeros(1, dtype=np.int64),
             age=np.zeros(1, dtype=np.int64),
             energy=np.array([self.cfg.shark_start_energy if energy is None else energy]),
@@ -261,13 +280,16 @@ class Simulation:
             )
         else:
             genes = random_genes(self.rng, SHARK_SPEC, n)
-            brain = random_brains(self.rng, n, cfg.brain_init_scale)
+            brain = random_brains(
+                self.rng, n, cfg.brain_init_scale, self.brain_spec.weight_count
+            )
             generation = np.zeros(n, dtype=np.int64)
         self.sharks.append(
             pos=self.rng.uniform(0, self.world, (n, 2)),
             vel=self._shark_spawn_vel(genes),
             genes=genes,
             brain=brain,
+            memory=self._blank_memory(n),
             generation=generation,
             age=np.zeros(n, dtype=np.int64),
             energy=np.full(n, cfg.shark_start_energy),
@@ -337,7 +359,14 @@ class Simulation:
         cfg = self.cfg
         sharks = self.sharks
         headings = self._shark_headings()
-        turn, throttle = forward(sharks.brain, self._shark_observe(headings))
+        obs = self._shark_observe(headings)
+        # Push this frame's senses into the stack for the next tick (newest
+        # first). NumPy buffers the overlapping slice assignment, so this is a
+        # genuine shift; a no-op when shark_memory_frames = 0.
+        if sharks.memory.shape[1]:
+            sharks.memory[:, 1:] = sharks.memory[:, :-1]
+            sharks.memory[:, 0] = obs[:, :N_SENSES]
+        turn, throttle = forward(self.brain_spec, sharks.brain, obs)
 
         theta = np.arctan2(headings[:, 1], headings[:, 0]) + turn * cfg.shark_max_turn
         min_speed = np.minimum(sharks.genes[:, S_MINSPD], sharks.genes[:, S_MAXSPD])
@@ -368,13 +397,15 @@ class Simulation:
         )
 
     def _shark_observe(self, headings: np.ndarray) -> np.ndarray:
-        """``(S, N_INPUTS)`` observations: the sector retina, then body senses —
-        energy (1.0 = ready to breed), speed (fraction of own top speed),
-        obstacle proximity, and a constant bias. Everything is bounded so no
-        input can dwarf the rest of an evolved network."""
+        """``(S, n_inputs)`` observations: this frame's sense block — the sector
+        retina, then energy (1.0 = ready to breed), speed (fraction of own top
+        speed) and obstacle proximity — followed by the stacked sense blocks of
+        the last ``shark_memory_frames`` frames (newest first) and a constant
+        bias. Everything is bounded so no input can dwarf the rest of an
+        evolved network. Read-only: the caller shifts the memory stack."""
         cfg = self.cfg
         sharks, fish = self.sharks, self.fish
-        obs = np.zeros((len(sharks), N_INPUTS))
+        obs = np.zeros((len(sharks), self.brain_spec.n_inputs))
         if len(fish):
             delta = fish.pos[None, :, :] - sharks.pos[:, None, :]  # (S, F, 2)
             if cfg.wrap_edges:
@@ -387,7 +418,8 @@ class Simulation:
         obs[:, 2 * N_SECTORS] = np.clip(sharks.energy / cfg.shark_repro_energy, 0.0, 1.0)
         obs[:, 2 * N_SECTORS + 1] = np.clip(speed / sharks.genes[:, S_MAXSPD], 0.0, 1.0)
         obs[:, 2 * N_SECTORS + 2] = self._shark_obstacle_signal()
-        obs[:, 2 * N_SECTORS + 3] = 1.0
+        obs[:, N_SENSES:-1] = sharks.memory.reshape(len(sharks), -1)
+        obs[:, -1] = 1.0
         return obs
 
     def _shark_obstacle_signal(self) -> np.ndarray:
@@ -515,6 +547,7 @@ class Simulation:
                 cfg.brain_mutation_rate, cfg.brain_mutation_sigma,
                 cfg.brain_weight_cap,
             ),
+            memory=self._blank_memory(k),
             generation=sharks.generation[parents] + 1,
             age=np.zeros(k, dtype=np.int64),
             energy=child_energy,

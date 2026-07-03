@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from brain import WEIGHT_COUNT
+from brain import N_SENSES
 from genome import FISH_SPEC, SHARK_SPEC
 
 
@@ -100,14 +100,17 @@ class FishState(_SoABase):
 
 class SharkState(_SoABase):
     """The shark population: like fish, plus the energy reserve that predation
-    tops up and metabolism drains, and each shark's neural-net weights."""
+    tops up and metabolism drains, each shark's neural-net weights, and its
+    short-term memory (the last ``memory_frames`` sense blocks, newest first —
+    the frame stack fed to the brain alongside the current frame)."""
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, weight_count: int, memory_frames: int):
         super().__init__(capacity, {
             "pos": ((2,), np.float64),
             "vel": ((2,), np.float64),
             "genes": ((SHARK_SPEC.count,), np.float64),
-            "brain": ((WEIGHT_COUNT,), np.float64),
+            "brain": ((weight_count,), np.float64),
+            "memory": ((memory_frames, N_SENSES), np.float64),
             "generation": ((), np.int64),
             "age": ((), np.int64),
             "energy": ((), np.float64),
@@ -128,6 +131,10 @@ class SharkState(_SoABase):
     @property
     def brain(self) -> np.ndarray:
         return self._view("brain")
+
+    @property
+    def memory(self) -> np.ndarray:
+        return self._view("memory")
 
     @property
     def generation(self) -> np.ndarray:

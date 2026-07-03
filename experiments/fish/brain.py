@@ -1,48 +1,75 @@
-"""Evolvable shark brains: one tiny MLP per shark, weights bred by the GA.
+"""Evolvable shark brains: one MLP per shark, weights bred by the GA.
 
 Each shark carries a flat weight vector (a row of the population's ``(S,
-WEIGHT_COUNT)`` array, stored beside its genes in :mod:`state`). Every tick the
+weight_count)`` array, stored beside its genes in :mod:`state`). Every tick the
 sim builds an egocentric observation per shark — a sector retina of the fish it
-can see plus a few body senses — and :func:`forward` maps all of them to a
-``(turn, throttle)`` pair in one batched pass. There is no learning rule:
+can see plus a few body senses, for the current frame *and* the last few
+(frame stacking, the net's only memory) — and :func:`forward` maps all of them
+to a ``(turn, throttle)`` pair in one batched pass. There is no learning rule:
 weights change only at birth (:func:`mutate_brains`), and hunting quality is
 selected the same way as any other gene — sharks that steer badly starve.
 
 Like :mod:`steering`, this module is pure array math (no config, no rng state,
 no sim imports) so every piece can be oracle-tested headlessly.
 
-The architecture is fixed at import time — ``N_SECTORS``/``N_HIDDEN`` size both
-the ``SharkState`` weight buffer and the reshape layout in :func:`forward`, so
-they are constants here rather than runtime config knobs.
+The architecture is *derived from config* at sim construction: a
+:class:`BrainSpec` turns ``(shark_memory_frames, shark_hidden)`` into input
+counts and the flat-weight reshape layout, and sizes the ``SharkState`` weight
+buffer. Only the retina resolution stays a compile-time constant.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-# --- Architecture (compile-time constants, see module docstring) ---------------
+# --- Architecture ---------------------------------------------------------------
 
 N_SECTORS = 8  # egocentric retina resolution around the shark's heading
-# Retina (closeness + count per sector) then body senses: energy, speed,
-# obstacle proximity, and a constant bias input. See sim._shark_observe for the
-# exact slot layout and normalisations.
-N_INPUTS = 2 * N_SECTORS + 4
-N_HIDDEN = 12
+# One frame's sense block: retina (closeness + count per sector) then body
+# senses — energy, speed, obstacle proximity. The constant bias input is NOT
+# part of the block (it would be redundant per frame); it's a single extra
+# slot at the end of the observation. See sim._shark_observe for the layout.
+N_SENSES = 2 * N_SECTORS + 3
 N_OUTPUTS = 2  # turn in [-1, 1], throttle in [0, 1]
 
-# Flat weight layout: input->hidden matrix first, then hidden->output. The
-# hidden layer's bias rides on a constant 1.0 appended to its activations (the
-# input layer's bias is the constant input slot), hence the +1 row in W2.
-_W1_LEN = N_INPUTS * N_HIDDEN
-WEIGHT_COUNT = _W1_LEN + (N_HIDDEN + 1) * N_OUTPUTS
+
+class BrainSpec:
+    """Shapes of the shark MLP, derived from config.
+
+    ``memory_frames`` past sense blocks are stacked after the current one, and
+    ``hidden`` sizes the tanh layers. Flat weight layout: each layer's matrix
+    in order. Every layer after the first gets a bias via a constant 1.0
+    appended to its incoming activations (the input layer's bias is the
+    constant observation slot), hence the ``+1`` row. One spec is shared by
+    every brain array in a sim — it sizes the ``SharkState`` weight buffer and
+    the reshape layout in :func:`forward`.
+    """
+
+    __slots__ = ("memory_frames", "hidden", "n_inputs", "weight_count", "layers")
+
+    def __init__(self, memory_frames: int, hidden: tuple[int, ...]):
+        assert memory_frames >= 0 and len(hidden) >= 1
+        self.memory_frames = memory_frames
+        self.hidden = tuple(hidden)
+        self.n_inputs = N_SENSES * (1 + memory_frames) + 1  # +1 = bias slot
+        sizes = (self.n_inputs, *self.hidden, N_OUTPUTS)
+        self.layers: list[tuple[int, int, int]] = []  # (offset, rows, cols)
+        offset = 0
+        for i in range(len(sizes) - 1):
+            rows = sizes[i] + (1 if i > 0 else 0)
+            self.layers.append((offset, rows, sizes[i + 1]))
+            offset += rows * sizes[i + 1]
+        self.weight_count = offset
 
 
 # --- Breeding weights (the GA operations, mirroring genome.py) ------------------
 
 
-def random_brains(rng: np.random.Generator, n: int, init_scale: float) -> np.ndarray:
-    """``(n, WEIGHT_COUNT)`` founder brains, weights uniform in ``±init_scale``."""
-    return rng.uniform(-init_scale, init_scale, (n, WEIGHT_COUNT))
+def random_brains(
+    rng: np.random.Generator, n: int, init_scale: float, weight_count: int
+) -> np.ndarray:
+    """``(n, weight_count)`` founder brains, weights uniform in ``±init_scale``."""
+    return rng.uniform(-init_scale, init_scale, (n, weight_count))
 
 
 def mutate_brains(
@@ -52,7 +79,7 @@ def mutate_brains(
     sigma: float,
     cap: float,
 ) -> np.ndarray:
-    """Child copies of ``parents`` ``(k, WEIGHT_COUNT)``: each weight has a
+    """Child copies of ``parents`` ``(k, weight_count)``: each weight has a
     ``rate`` chance of a Gaussian nudge, clipped to ``±cap``.
 
     Unlike :func:`genome.mutate_genes`, ``sigma`` is in absolute weight units —
@@ -68,7 +95,7 @@ def crossover_brains(
     rng: np.random.Generator, mothers: np.ndarray, fathers: np.ndarray
 ) -> np.ndarray:
     """Uniform per-weight crossover of two aligned parent stacks
-    ``(k, WEIGHT_COUNT)``: each child weight comes from either parent with
+    ``(k, weight_count)``: each child weight comes from either parent with
     equal odds.
 
     Mixing weights of two independently evolved nets can break co-adapted
@@ -128,21 +155,27 @@ def sector_retina(
     return retina
 
 
-def forward(brains: np.ndarray, obs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def forward(
+    spec: BrainSpec, brains: np.ndarray, obs: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     """Run every shark's own network on its own observation, in one batch.
 
-    ``brains`` ``(S, WEIGHT_COUNT)``, ``obs`` ``(S, N_INPUTS)`` →
+    ``brains`` ``(S, spec.weight_count)``, ``obs`` ``(S, spec.n_inputs)`` →
     ``(turn, throttle)``, each ``(S,)``: ``turn`` in ``[-1, 1]`` (tanh) is a
     fraction of the max turn rate, ``throttle`` in ``[0, 1]`` (sigmoid) picks a
     speed between the shark's min- and max-speed genes. Pure and deterministic;
     the caller applies both scalings.
     """
     s = len(brains)
-    w1 = brains[:, :_W1_LEN].reshape(s, N_INPUTS, N_HIDDEN)
-    w2 = brains[:, _W1_LEN:].reshape(s, N_HIDDEN + 1, N_OUTPUTS)
-    hidden = np.tanh(np.einsum("si,sih->sh", obs, w1))
-    hidden = np.concatenate([hidden, np.ones((s, 1))], axis=1)
-    out = np.einsum("sk,sko->so", hidden, w2)
-    turn = np.tanh(out[:, 0])
-    throttle = 1.0 / (1.0 + np.exp(-out[:, 1]))
+    x = obs
+    last = len(spec.layers) - 1
+    for i, (offset, rows, cols) in enumerate(spec.layers):
+        if i > 0:  # the bias constant for every layer past the input
+            x = np.concatenate([x, np.ones((s, 1))], axis=1)
+        w = brains[:, offset : offset + rows * cols].reshape(s, rows, cols)
+        x = np.einsum("si,sio->so", x, w)
+        if i < last:
+            x = np.tanh(x)
+    turn = np.tanh(x[:, 0])
+    throttle = 1.0 / (1.0 + np.exp(-x[:, 1]))
     return turn, throttle

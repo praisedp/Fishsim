@@ -11,9 +11,9 @@ import numpy as np
 from pygame.math import Vector2
 
 from brain import (
-    N_INPUTS,
     N_SECTORS,
-    WEIGHT_COUNT,
+    N_SENSES,
+    BrainSpec,
     forward,
     mutate_brains,
     random_brains,
@@ -247,8 +247,9 @@ def test_rescue_breeds_children_from_two_elites():
     cfg = Config(num_fish=0, num_sharks=0, rescue_mut_scale=0.0)
     sim = Simulation(cfg, seed=5)
     lo, hi = SHARK_SPEC.lo.copy(), SHARK_SPEC.hi.copy()
-    sim.add_shark((100.0, 100.0), genes=lo, energy=300.0, weights=np.full(WEIGHT_COUNT, -1.0))
-    sim.add_shark((200.0, 200.0), genes=hi, energy=300.0, weights=np.full(WEIGHT_COUNT, 1.0))
+    w = sim.brain_spec.weight_count
+    sim.add_shark((100.0, 100.0), genes=lo, energy=300.0, weights=np.full(w, -1.0))
+    sim.add_shark((200.0, 200.0), genes=hi, energy=300.0, weights=np.full(w, 1.0))
     sim._update_hall_of_fame()
     sim.sharks.compact(np.zeros(len(sim.sharks), dtype=bool))  # extinct
     sim.rescue_sharks(6)
@@ -307,16 +308,29 @@ def test_ecosystem_runs_within_invariants():
 # --- Shark brains -------------------------------------------------------------
 
 
+def test_brain_spec_shapes():
+    # No memory + one hidden layer reproduces the pre-frame-stacking network:
+    # 20 inputs (19 senses + bias) and 20*12 + 13*2 = 266 weights.
+    old = BrainSpec(0, (12,))
+    assert old.n_inputs == 20 and old.weight_count == 266
+    # The default config: 3 past frames, two hidden layers.
+    spec = BrainSpec(3, (24, 12))
+    assert spec.n_inputs == N_SENSES * 4 + 1 == 77
+    assert spec.weight_count == 77 * 24 + 25 * 12 + 13 * 2 == 2174
+    assert Simulation(Config(num_fish=0, num_sharks=0)).brain_spec.n_inputs > 0
+
+
 def test_brain_forward_shapes_bounds_and_determinism():
     rng = np.random.default_rng(0)
-    brains = random_brains(rng, 6, 0.8)
-    obs = rng.uniform(0.0, 1.0, (6, N_INPUTS))
-    turn, throttle = forward(brains, obs)
-    assert turn.shape == (6,) and throttle.shape == (6,)
-    assert np.all(np.abs(turn) <= 1.0)
-    assert np.all((throttle >= 0.0) & (throttle <= 1.0))
-    turn2, throttle2 = forward(brains, obs)
-    assert np.array_equal(turn, turn2) and np.array_equal(throttle, throttle2)
+    for spec in (BrainSpec(0, (12,)), BrainSpec(3, (24, 12))):
+        brains = random_brains(rng, 6, 0.8, spec.weight_count)
+        obs = rng.uniform(0.0, 1.0, (6, spec.n_inputs))
+        turn, throttle = forward(spec, brains, obs)
+        assert turn.shape == (6,) and throttle.shape == (6,)
+        assert np.all(np.abs(turn) <= 1.0)
+        assert np.all((throttle >= 0.0) & (throttle <= 1.0))
+        turn2, throttle2 = forward(spec, brains, obs)
+        assert np.array_equal(turn, turn2) and np.array_equal(throttle, throttle2)
 
 
 def _oracle_retina(shark_pos, headings, fish_pos, perception, count_norm):
@@ -375,11 +389,49 @@ def test_sector_retina_empty_cases():
 
 def test_brain_mutation_identity_and_clamp():
     rng = np.random.default_rng(2)
-    parents = random_brains(rng, 40, 0.8)
+    parents = random_brains(rng, 40, 0.8, BrainSpec(0, (12,)).weight_count)
     assert np.array_equal(mutate_brains(rng, parents, 0.0, 0.5, 2.0), parents)
     children = mutate_brains(rng, parents, 1.0, 10.0, 2.0)
     assert np.all(np.abs(children) <= 2.0)
     assert not np.array_equal(children, parents)
+
+
+def test_frame_stack_carries_previous_senses():
+    cfg = Config(num_fish=30, num_sharks=1, shark_memory_frames=2)
+    sim = Simulation(cfg, seed=9)
+    obs1 = sim._shark_observe(sim._shark_headings())
+    # A newborn's memory is blank ("saw nothing before"); the bias slot is 1.
+    assert not obs1[:, N_SENSES:-1].any()
+    assert np.all(obs1[:, -1] == 1.0)
+    # step() observes the same pre-move state, then pushes it into the stack:
+    # next tick's frame-1 block must equal this tick's current block.
+    sim.step()
+    assert len(sim.sharks) == 1  # nothing culled it mid-test
+    obs2 = sim._shark_observe(sim._shark_headings())
+    assert np.allclose(obs2[:, N_SENSES : 2 * N_SENSES], obs1[:, :N_SENSES])
+    # After a second step the original frame reaches the oldest slot.
+    sim.step()
+    obs3 = sim._shark_observe(sim._shark_headings())
+    assert np.allclose(obs3[:, 2 * N_SENSES : 3 * N_SENSES], obs1[:, :N_SENSES])
+
+
+def test_memory_survives_compaction():
+    cfg = Config(num_fish=0, num_sharks=0, shark_memory_frames=2)
+    sim = Simulation(cfg, seed=10)
+    sim.add_shark((100.0, 100.0))
+    sim.add_shark((200.0, 200.0))
+    sim.sharks.memory[0] = 1.0
+    sim.sharks.memory[1] = 2.0
+    sim.sharks.compact(np.array([False, True]))  # the first shark dies
+    assert np.all(sim.sharks.memory[0] == 2.0)  # the survivor keeps its own
+
+
+def test_zero_memory_frames_still_runs():
+    cfg = Config(num_fish=50, num_sharks=3, shark_memory_frames=0)
+    sim = Simulation(cfg, seed=11)
+    assert sim.brain_spec.n_inputs == N_SENSES + 1  # just senses + bias
+    for _ in range(5):
+        sim.step()
 
 
 def test_shark_speed_stays_between_its_speed_genes():
