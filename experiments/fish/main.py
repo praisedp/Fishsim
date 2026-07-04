@@ -7,6 +7,10 @@ the HUD over a few minutes.
 
 Run it:  uv run python main.py   (from experiments/fish/)
 
+The window is resizable — the sea is always exactly the window, so dragging a
+border grows or shrinks the world live (wrap, bounce, spawning and walls all
+follow the new bounds).
+
 Controls:
   - M: toggle MANUAL shark — the mouse drives the nearest shark; others stay auto.
   - K: cycle which gene the SHARK colour maps to.
@@ -126,12 +130,13 @@ def draw_sharks(
 def main() -> None:
     cfg = Config()
     pygame.init()
-    screen = pygame.display.set_mode((cfg.width, cfg.height))
+    screen = pygame.display.set_mode((cfg.width, cfg.height), pygame.RESIZABLE)
     pygame.display.set_caption("Coevolving Boids — fish vs. sharks")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("monospace", 14)
-    # One reusable transparent overlay (kill rings); cleared, not reallocated.
-    overlay = pygame.Surface((cfg.width, cfg.height), pygame.SRCALPHA)
+    # One reusable transparent overlay (kill rings); cleared, not reallocated
+    # per frame — only when the window is resized.
+    overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
 
     sim = Simulation(cfg)
     paused = False
@@ -143,6 +148,12 @@ def main() -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.VIDEORESIZE:
+                # The display surface already tracks the window; the sim world
+                # and the alpha overlay have to be told the new size.
+                screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
+                overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+                sim.resize(*screen.get_size())
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False

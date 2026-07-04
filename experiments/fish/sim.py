@@ -105,6 +105,42 @@ class Simulation:
         else:
             self.walls = WallField([])
 
+    # --- World size -----------------------------------------------------------
+
+    def resize(self, width: int, height: int) -> None:
+        """Adopt a new world size (the window was resized).
+
+        Updating ``cfg`` and the cached ``world`` vector is enough for every
+        per-tick rule — spawning, the neighbour grid, min-image distances,
+        wrap-around and edge bounce all read from these. Animals stranded
+        beyond a shrunk border are wrapped (wrap mode) or clamped (bounce
+        mode) right away so nothing sits off-screen while paused. Wall shards
+        that no longer fit are dropped; the surviving layout is kept rather
+        than re-scattered, so a drag-resize doesn't reshuffle the maze
+        ([O] twice deals a fresh layout for the new size).
+        """
+        cfg = self.cfg
+        cfg.width, cfg.height = max(1, int(width)), max(1, int(height))
+        self.world = np.array([float(cfg.width), float(cfg.height)])
+        for state in (self.fish, self.sharks):
+            if not len(state):
+                continue
+            if cfg.wrap_edges:
+                state.pos[:] %= self.world
+            else:
+                np.clip(state.pos, 0.0, self.world, out=state.pos)
+        if self.walls.shards:
+            kept = [
+                s
+                for s in self.walls.shards
+                if s.min_x >= 0.0
+                and s.min_y >= 0.0
+                and s.max_x <= cfg.width
+                and s.max_y <= cfg.height
+            ]
+            if len(kept) != len(self.walls.shards):
+                self.walls = WallField(kept)
+
     # --- Spawning -----------------------------------------------------------
 
     def _spawn_initial_populations(self) -> None:

@@ -786,6 +786,63 @@ def test_walls_no_spurious_far_push():
     assert not push.any() and not eject.any()
 
 
+# --- Window resize ------------------------------------------------------------
+
+
+def test_resize_wraps_animals_into_the_smaller_world():
+    cfg = Config(num_fish=60, num_sharks=5, wrap_edges=True, width=800, height=600)
+    sim = Simulation(cfg, seed=3)
+    sim.resize(300, 200)
+    assert (cfg.width, cfg.height) == (300, 200)
+    assert np.all(sim.world == (300.0, 200.0))
+    for pos in (sim.fish.pos, sim.sharks.pos):
+        assert np.all(pos >= 0.0) and np.all(pos < (300.0, 200.0))
+
+
+def test_resize_clamps_animals_in_bounce_mode():
+    cfg = Config(num_fish=60, num_sharks=5, wrap_edges=False, width=800, height=600)
+    sim = Simulation(cfg, seed=3)
+    sim.resize(300, 200)
+    for pos in (sim.fish.pos, sim.sharks.pos):
+        assert np.all(pos >= 0.0) and np.all(pos <= (300.0, 200.0))
+
+
+def test_resize_keeps_sim_and_respawns_inside_the_new_bounds():
+    cfg = Config(
+        num_fish=80, num_sharks=4, wrap_edges=True, width=700, height=500,
+        fish_respawn_rate=5.0,
+    )
+    sim = Simulation(cfg, seed=4)
+    sim.resize(350, 250)
+    for _ in range(100):
+        sim.step()
+    assert np.all(sim.fish.pos >= 0.0)
+    assert np.all(sim.fish.pos < (float(cfg.width), float(cfg.height)))
+    if len(sim.sharks):
+        assert np.all(sim.sharks.pos >= 0.0)
+        assert np.all(sim.sharks.pos < (float(cfg.width), float(cfg.height)))
+
+
+def test_resize_drops_only_walls_that_no_longer_fit():
+    cfg = Config(
+        num_fish=0, num_sharks=0, walls_enabled=True, num_walls=20,
+        width=1000, height=800,
+    )
+    sim = Simulation(cfg, seed=5)
+    before = len(sim.walls.shards)
+    sim.resize(400, 300)
+    kept = sim.walls.shards
+    assert len(kept) < before  # a 1000x800 scatter can't all fit in 400x300
+    assert all(
+        s.min_x >= 0.0 and s.min_y >= 0.0 and s.max_x <= 400.0 and s.max_y <= 300.0
+        for s in kept
+    )
+    # Growing back neither resurrects dropped shards nor reshuffles survivors.
+    survivors = len(kept)
+    sim.resize(1000, 800)
+    assert sim.walls.shards is kept or len(sim.walls.shards) == survivors
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
