@@ -1,17 +1,17 @@
-"""Coevolving Boids: a sea of fish and a population of sharks, both evolving.
+"""Boids vs. evolving sharks: rule-based fish prey and a GA-bred predator.
 
-Fish carry genes for flocking/fleeing; sharks carry body genes (speed range, sight)
-plus a small evolved neural net that steers them, and live or die by an energy
-budget. Watch the predator–prey arms race play out in the HUD over a few minutes.
+Fish are classic boids — identical, config-tuned, non-evolving. Sharks carry
+body genes (speed range, sight) plus a small evolved neural net that steers
+them, and live or die by an energy budget. Watch the sharks learn to hunt in
+the HUD over a few minutes.
 
 Run it:  uv run python main.py   (from experiments/fish/)
 
 Controls:
   - M: toggle MANUAL shark — the mouse drives the nearest shark; others stay auto.
-  - C: cycle which gene the FISH colour maps to.
   - K: cycle which gene the SHARK colour maps to.
   - O: toggle the geometric wall obstacles (re-scatters a fresh layout when on).
-  - R: reset / reseed the world (handy if a species has gone extinct).
+  - R: reset / reseed the world (handy if the sharks have gone extinct).
   - W: toggle wrap-around vs soft-bounce edges.
   - Space: pause/resume.   Esc / window close: quit.
 """
@@ -22,7 +22,7 @@ import numpy as np
 import pygame
 
 from config import Config
-from genome import FISH_SPEC, GENE_NAMES, SHARK_GENE_NAMES, SHARK_SPEC, gene_fractions
+from genome import SHARK_GENE_NAMES, SHARK_SPEC, gene_fractions
 from sim import Simulation
 
 # Colours
@@ -48,19 +48,9 @@ HUD_X = 10
 HUD_Y = 10
 HUD_LINE_H = 18
 
-# Fish colours only depend on a 0–1 gene fraction, so a small precomputed ramp
-# replaces a per-fish-per-frame Color.hsva construction.
-COLOR_LUT_SIZE = 64
-
-
-def fish_color(fraction: float) -> pygame.Color:
-    """Map a 0–1 fish-gene fraction to a hue: low = calm blue, high = bold red."""
-    color = pygame.Color(0)
-    color.hsva = (HUE_BLUE * (1.0 - fraction), 85, 100, 100)
-    return color
-
-
-FISH_COLOR_LUT = [fish_color(k / (COLOR_LUT_SIZE - 1)) for k in range(COLOR_LUT_SIZE)]
+# Every fish is identical (rule-based boids, no genes), so one calm blue.
+FISH_COLOR = pygame.Color(0)
+FISH_COLOR.hsva = (HUE_BLUE, 85, 100, 100)
 
 
 def shark_color(fraction: float, energy_frac: float) -> pygame.Color:
@@ -89,8 +79,8 @@ def draw_walls(surface: pygame.Surface, walls) -> None:
         pygame.draw.polygon(surface, WALL_EDGE, verts, 1)
 
 
-def draw_fish_all(surface: pygame.Surface, sim: Simulation, gene: str) -> None:
-    """Every fish as a small triangle pointing along its velocity, tinted by a gene.
+def draw_fish_all(surface: pygame.Surface, sim: Simulation) -> None:
+    """Every fish as a small triangle pointing along its velocity.
 
     The triangle geometry is computed for the whole school in a few array ops;
     only the unavoidable per-polygon draw call remains a Python loop.
@@ -103,11 +93,8 @@ def draw_fish_all(surface: pygame.Surface, sim: Simulation, gene: str) -> None:
     tips = (fish.pos + heading * FISH_NOSE).tolist()
     lefts = (fish.pos - heading * FISH_TAIL + side * FISH_HALF_W).tolist()
     rights = (fish.pos - heading * FISH_TAIL - side * FISH_HALF_W).tolist()
-    buckets = (
-        gene_fractions(fish.genes, FISH_SPEC, gene) * (COLOR_LUT_SIZE - 1)
-    ).astype(int).tolist()
-    for tip, left, right, bucket in zip(tips, lefts, rights, buckets):
-        pygame.draw.polygon(surface, FISH_COLOR_LUT[bucket], (tip, left, right))
+    for tip, left, right in zip(tips, lefts, rights):
+        pygame.draw.polygon(surface, FISH_COLOR, (tip, left, right))
 
 
 def draw_sharks(
@@ -149,7 +136,6 @@ def main() -> None:
     sim = Simulation(cfg)
     paused = False
     manual = False
-    fish_gene_idx = GENE_NAMES.index(cfg.color_gene)
     shark_gene_idx = SHARK_GENE_NAMES.index(cfg.shark_color_gene)
     running = True
 
@@ -166,8 +152,6 @@ def main() -> None:
                     cfg.wrap_edges = not cfg.wrap_edges
                 elif event.key == pygame.K_m:
                     manual = not manual
-                elif event.key == pygame.K_c:
-                    fish_gene_idx = (fish_gene_idx + 1) % len(GENE_NAMES)
                 elif event.key == pygame.K_k:
                     shark_gene_idx = (shark_gene_idx + 1) % len(SHARK_GENE_NAMES)
                 elif event.key == pygame.K_o:
@@ -178,7 +162,6 @@ def main() -> None:
                 elif event.key == pygame.K_r:
                     sim = Simulation(cfg)
 
-        fish_gene = GENE_NAMES[fish_gene_idx]
         shark_gene = SHARK_GENE_NAMES[shark_gene_idx]
 
         if not paused:
@@ -191,11 +174,11 @@ def main() -> None:
 
         if cfg.walls_enabled:
             draw_walls(screen, sim.walls)
-        draw_fish_all(screen, sim, fish_gene)
+        draw_fish_all(screen, sim)
         draw_sharks(screen, overlay, sim, shark_gene)
 
         screen.blit(overlay, (0, 0))
-        _draw_hud(screen, font, sim, cfg, clock, manual, fish_gene, shark_gene)
+        _draw_hud(screen, font, sim, cfg, clock, manual, shark_gene)
 
         pygame.display.flip()
         clock.tick(cfg.fps)
@@ -203,16 +186,15 @@ def main() -> None:
     pygame.quit()
 
 
-def _draw_hud(screen, font, sim, cfg, clock, manual, fish_gene, shark_gene) -> None:
+def _draw_hud(screen, font, sim, cfg, clock, manual, shark_gene) -> None:
     """Live stats: a fish block, a shark block, then a controls/legend line."""
     s = sim.stats
     mode = "mouse" if manual else "auto"
     edges = "wrap" if cfg.wrap_edges else "bounce"
 
     fish_line = (
-        f"FISH   pop:{int(s['population']):3d}  births:{int(s['births'])}  "
-        f"deaths:{int(s['deaths'])}  gen:{s['generation']:4.1f}   "
-        + "  ".join(f"{n}:{s[n]:.2f}" for n in GENE_NAMES)
+        f"FISH   pop:{int(s['population']):3d}  respawned:{int(s['births'])}  "
+        f"eaten:{int(s['deaths'])}"
     )
     shark_line = (
         f"SHARK  pop:{int(s['shark_population']):3d}  births:{int(s['shark_births'])}  "
@@ -222,8 +204,8 @@ def _draw_hud(screen, font, sim, cfg, clock, manual, fish_gene, shark_gene) -> N
     )
     status_line = (
         f"fps:{clock.get_fps():3.0f}  shark:{mode}  edges:{edges}   "
-        f"fish=[{fish_gene}] shark=[{shark_gene}]   "
-        f"[M]shark [C]fishcol [K]sharkcol [O]walls [B]rescue [R]reset [W]edges [Space]pause"
+        f"shark=[{shark_gene}]   "
+        f"[M]shark [K]sharkcol [O]walls [B]rescue [R]reset [W]edges [Space]pause"
     )
 
     for i, text in enumerate((fish_line, shark_line, status_line)):

@@ -16,7 +16,6 @@ from __future__ import annotations
 import numpy as np
 
 from config import Config
-from genome import F_FEAR, F_MAXSPD, F_WALI, F_WCOH, F_WFLEE, F_WSEP
 
 # Guards divisions by ~zero lengths only; never changes which rows get clamped
 # or which pairs count (those cuts are made on exact comparisons beforehand).
@@ -95,24 +94,20 @@ def flock_desires(
 def flee_desire(
     offset: np.ndarray,
     d2: np.ndarray,
-    fear: np.ndarray,
     flee_radius: float,
 ) -> np.ndarray:
     """Desire away from each fish's nearest shark — stronger up close.
 
-    ``offset`` points from the shark to the fish. The trigger range is the base
-    ``flee_radius`` scaled by each fish's ``fear`` gene, so timid fish bolt early
-    and bold fish hold their nerve. ``offset / d²`` is the unit direction over
+    ``offset`` points from the shark to the fish; fish farther than
+    ``flee_radius`` ignore it. ``offset / d²`` is the unit direction over
     distance: closer shark, larger desire (steering renormalises magnitude).
     """
-    radius2 = (flee_radius * fear) ** 2
-    active = (d2 > 0.0) & (d2 <= radius2)
+    active = (d2 > 0.0) & (d2 <= flee_radius**2)
     return np.where(active[:, None], offset / np.maximum(d2, EPS)[:, None], 0.0)
 
 
 def fish_accelerations(
     vel: np.ndarray,
-    genes: np.ndarray,
     i: np.ndarray,
     j: np.ndarray,
     rel: np.ndarray,
@@ -121,17 +116,18 @@ def fish_accelerations(
     flee_d2: np.ndarray | None,
     cfg: Config,
 ) -> np.ndarray:
-    """The whole fish brain for one tick: the four rules, steered and summed with
-    each fish's own genome weights. ``flee_offset`` / ``flee_d2`` are None when no
-    sharks are alive (nothing to flee)."""
+    """The whole fish behaviour for one tick: the three classic boid rules plus
+    flee-from-shark, steered and summed with the shared config weights (every
+    fish is identical — no genes). ``flee_offset`` / ``flee_d2`` are None when
+    no sharks are alive (nothing to flee)."""
     n = len(vel)
     sep, ali, coh = flock_desires(i, j, rel, d2, vel, n, cfg.separation_radius)
-    max_speed = genes[:, F_MAXSPD]
+    max_speed = cfg.fish_max_speed
 
-    accel = genes[:, F_WSEP, None] * steer_towards(sep, vel, max_speed, cfg.max_force)
-    accel += genes[:, F_WALI, None] * steer_towards(ali, vel, max_speed, cfg.max_force)
-    accel += genes[:, F_WCOH, None] * steer_towards(coh, vel, max_speed, cfg.max_force)
+    accel = cfg.fish_w_sep * steer_towards(sep, vel, max_speed, cfg.max_force)
+    accel += cfg.fish_w_ali * steer_towards(ali, vel, max_speed, cfg.max_force)
+    accel += cfg.fish_w_coh * steer_towards(coh, vel, max_speed, cfg.max_force)
     if flee_offset is not None:
-        flee = flee_desire(flee_offset, flee_d2, genes[:, F_FEAR], cfg.flee_radius)
-        accel += genes[:, F_WFLEE, None] * steer_towards(flee, vel, max_speed, cfg.max_force)
+        flee = flee_desire(flee_offset, flee_d2, cfg.flee_radius)
+        accel += cfg.fish_w_flee * steer_towards(flee, vel, max_speed, cfg.max_force)
     return accel

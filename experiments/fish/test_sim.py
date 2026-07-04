@@ -21,15 +21,6 @@ from brain import (
 )
 from config import Config
 from genome import (
-    F_FEAR,
-    F_MAXSPD,
-    F_PERC,
-    F_WALI,
-    F_WCOH,
-    F_WFLEE,
-    F_WSEP,
-    FISH_SPEC,
-    GENE_RANGES,
     S_MAXSPD,
     S_MINSPD,
     S_PERC,
@@ -44,15 +35,11 @@ from state import FishState
 from steering import fish_accelerations, flee_desire
 from walls import Shard, WallField, avoid_all
 
-_CELL_MIN = float(FISH_SPEC.hi[F_PERC])
-
-
-def _fish_genes(**overrides) -> np.ndarray:
-    """Fish genes ``(G,)`` with every gene at mid-range, save any overrides."""
-    genes = FISH_SPEC.mid()
-    for name, value in overrides.items():
-        genes[FISH_SPEC.col(name)] = value
-    return genes
+# The neighbour-kernel tests exercise heterogeneous perception radii (the kernel
+# supports them even though every fish now shares one config value). The grid
+# cell must be at least the largest radius for the 9-cell search to be exact.
+_PERC_RANGE = (20.0, 80.0)
+_CELL_MIN = _PERC_RANGE[1]
 
 
 def _speeds(vel: np.ndarray) -> np.ndarray:
@@ -62,26 +49,22 @@ def _speeds(vel: np.ndarray) -> np.ndarray:
 # --- Core physics -----------------------------------------------------------
 
 
-def test_speed_never_exceeds_each_fishs_max():
+def test_speed_never_exceeds_the_shared_max():
     cfg = Config(num_fish=120, width=600, height=400)
     sim = Simulation(cfg, seed=1)
     for _ in range(200):
         sim.step((300.0, 200.0))
-    assert np.all(_speeds(sim.fish.vel) <= sim.fish.genes[:, F_MAXSPD] + 1e-6)
+    assert np.all(_speeds(sim.fish.vel) <= cfg.fish_max_speed + 1e-6)
     assert np.all(np.isfinite(sim.fish.pos))  # not NaN
 
 
-def test_per_fish_max_speed_clamp():
+def test_fish_max_speed_clamp():
     cfg = Config(num_fish=0, num_sharks=0)
     sim = Simulation(cfg, seed=1)
-    sim.add_fish((100.0, 100.0), genes=_fish_genes(max_speed=2.0), vel=(0.0, 0.0))
-    sim.add_fish((100.0, 100.0), genes=_fish_genes(max_speed=5.0), vel=(0.0, 0.0))
-    # An absurd shove; each fish should clamp to its own gene's max.
-    sim._integrate_fish(np.array([[99.0, 0.0], [99.0, 0.0]]))
-    slow, fast = _speeds(sim.fish.vel)
-    assert slow <= 2.0 + 1e-6
-    assert fast <= 5.0 + 1e-6
-    assert fast > slow  # faster gene -> faster fish
+    sim.add_fish((100.0, 100.0), vel=(0.0, 0.0))
+    # An absurd shove; the fish should clamp to the shared max speed.
+    sim._integrate_fish(np.array([[99.0, 0.0]]))
+    assert _speeds(sim.fish.vel)[0] <= cfg.fish_max_speed + 1e-6
 
 
 def test_positions_stay_in_bounds_when_wrapping():
@@ -93,13 +76,33 @@ def test_positions_stay_in_bounds_when_wrapping():
     assert np.all(sim.fish.pos < (cfg.width, cfg.height))
 
 
-def test_separation_pushes_close_fish_apart():
+def test_cancelled_velocity_keeps_drifting():
     cfg = Config(num_fish=0, num_sharks=0)
     sim = Simulation(cfg, seed=1)
-    # Separation-only genomes so the rule under test isn't fought by cohesion.
-    genes = _fish_genes(w_sep=2.0, w_ali=0.0, w_coh=0.0, w_flee=0.0)
-    sim.add_fish((100.0, 100.0), genes=genes, vel=(0.0, 0.0))
-    sim.add_fish((105.0, 100.0), genes=genes, vel=(0.0, 0.0))
+    sim.add_fish((100.0, 100.0), vel=(1.0, 0.0))
+    sim._integrate_fish(np.array([[-1.0, 0.0]]))  # exactly cancels the motion
+    assert np.isclose(np.linalg.norm(sim.fish.vel[0]), cfg.min_speed)
+    assert sim.fish.vel[0, 0] > 0  # kept the previous heading
+
+
+def test_soft_bounce_keeps_fish_inside_world():
+    cfg = Config(num_fish=80, num_sharks=0, wrap_edges=False, width=500, height=400)
+    sim = Simulation(cfg, seed=6)
+    for _ in range(300):
+        sim.step()
+        assert np.all(sim.fish.pos >= 0.0)
+        assert np.all(sim.fish.pos <= (float(cfg.width), float(cfg.height)))
+
+
+def test_separation_pushes_close_fish_apart():
+    # Separation-only weights so the rule under test isn't fought by cohesion.
+    cfg = Config(
+        num_fish=0, num_sharks=0,
+        fish_w_sep=2.0, fish_w_ali=0.0, fish_w_coh=0.0, fish_w_flee=0.0,
+    )
+    sim = Simulation(cfg, seed=1)
+    sim.add_fish((100.0, 100.0), vel=(0.0, 0.0))
+    sim.add_fish((105.0, 100.0), vel=(0.0, 0.0))
     start_gap = 5.0
     for _ in range(5):
         sim.step()
@@ -108,36 +111,36 @@ def test_separation_pushes_close_fish_apart():
 
 def test_flee_desire_points_away_and_handles_no_shark():
     cfg = Config()
-    fear = np.array([FISH_SPEC.mid()[F_FEAR]])
     # Shark just to the right (offset points left): desire pushes left, away.
-    desire = flee_desire(np.array([[-10.0, 0.0]]), np.array([100.0]), fear, cfg.flee_radius)
+    desire = flee_desire(np.array([[-10.0, 0.0]]), np.array([100.0]), cfg.flee_radius)
     assert desire[0, 0] < 0
-    # A shark beyond the fear-scaled radius exerts no force.
-    far = flee_desire(np.array([[9000.0, 0.0]]), np.array([9000.0**2]), fear, cfg.flee_radius)
+    # A shark beyond the flee radius exerts no force.
+    far = flee_desire(np.array([[9000.0, 0.0]]), np.array([9000.0**2]), cfg.flee_radius)
     assert not far.any()
     # No sharks alive: the flee inputs are None and no force appears at all.
     none_pair = np.empty(0, dtype=np.int64)
     accel = fish_accelerations(
-        np.zeros((1, 2)), _fish_genes()[None], none_pair, none_pair,
+        np.zeros((1, 2)), none_pair, none_pair,
         np.empty((0, 2)), np.empty(0), None, None, cfg,
     )
     assert not accel.any()
 
 
-# --- Fish genetic algorithm -------------------------------------------------
+# --- Fish respawn (no evolution) ----------------------------------------------
 
 
-def test_mature_fish_reproduce_and_grow_population():
-    cfg = Config(
-        num_fish=10, num_sharks=0, maturity_age=2, repro_prob=1.0, max_pop=40,
-    )
+def test_eaten_fish_trickle_back_up_to_num_fish():
+    cfg = Config(num_fish=20, num_sharks=0, fish_respawn_rate=0.5)
     sim = Simulation(cfg, seed=3)
-    start = len(sim.fish)
-    for _ in range(8):
+    sim.fish.compact(np.arange(20) < 5)  # 15 fish "eaten", 5 left
+    assert len(sim.fish) == 5
+    for _ in range(10):
         sim.step()
-    assert sim.births > 0
-    assert start < len(sim.fish) <= cfg.max_pop
-    assert sim.stats["generation"] > 0.0  # children carry deeper lineage
+    assert len(sim.fish) == 10  # 0.5/tick * 10 ticks = 5 respawns
+    assert sim.births == 5  # births counts respawns
+    for _ in range(100):
+        sim.step()
+    assert len(sim.fish) == cfg.num_fish  # refilled, and never past the cap
 
 
 # --- Shark genetic algorithm ------------------------------------------------
@@ -301,7 +304,7 @@ def test_ecosystem_runs_within_invariants():
     sim = Simulation(cfg, seed=5)
     for _ in range(300):
         sim.step()  # fully autonomous
-        assert 0 <= len(sim.fish) <= cfg.max_pop
+        assert 0 <= len(sim.fish) <= cfg.num_fish
         assert 0 <= len(sim.sharks) <= cfg.max_sharks
 
 
@@ -532,13 +535,16 @@ def test_wall_avoidance_pushes_outward():
 
 
 def test_fish_does_not_penetrate_wall():
-    cfg = Config(num_fish=0, num_sharks=0, walls_enabled=False, width=600, height=400)
+    cfg = Config(
+        num_fish=0, num_sharks=0, walls_enabled=False, width=600, height=400,
+        fish_max_speed=5.0,
+    )
     sim = Simulation(cfg, seed=1)
     shard = _square_shard(300, 200, half=30.0)
     sim.walls = WallField([shard])
     cfg.walls_enabled = True
     # A fish to the left, driving straight at the shard at top speed.
-    sim.add_fish((220.0, 200.0), genes=_fish_genes(max_speed=5.0), vel=(5.0, 0.0))
+    sim.add_fish((220.0, 200.0), vel=(5.0, 0.0))
     for _ in range(60):
         sim.step()
         # Signed distance to the nearest face: >0 outside, <0 inside. Never let the
@@ -555,10 +561,10 @@ def test_ecosystem_runs_with_walls():
     assert len(sim.walls.shards) == cfg.num_walls
     for _ in range(300):
         sim.step()
-        assert 0 <= len(sim.fish) <= cfg.max_pop
+        assert 0 <= len(sim.fish) <= cfg.num_fish
         assert 0 <= len(sim.sharks) <= cfg.max_sharks
     assert np.all(np.isfinite(sim.fish.pos))  # not NaN
-    assert np.all(_speeds(sim.fish.vel) <= sim.fish.genes[:, F_MAXSPD] + 1e-6)
+    assert np.all(_speeds(sim.fish.vel) <= cfg.fish_max_speed + 1e-6)
 
 
 # --- Vectorized engine kernels ------------------------------------------------
@@ -596,7 +602,7 @@ def test_pairs_match_brute_force():
     w, h = 1400, 800
     pos = rng.uniform(0, (w, h), (300, 2))
     pos[0], pos[1] = (1330.0, 100.0), (5.0, 100.0)
-    radii = rng.uniform(*GENE_RANGES["perception"], 300)
+    radii = rng.uniform(*_PERC_RANGE, 300)
     radii[0] = radii[1] = 80.0
     assert _pair_set(pos, radii, w, h, True) == _brute_pair_set(pos, radii, w, h, True)
     assert (0, 1) in _pair_set(pos, radii, w, h, True)  # the seam pair was found
@@ -604,14 +610,14 @@ def test_pairs_match_brute_force():
     # Bounce mode, incl. fish drifted off-screen (soft edges allow it).
     w, h = 800, 600
     pos = rng.uniform(-40, (w + 40, h + 40), (300, 2))
-    radii = rng.uniform(*GENE_RANGES["perception"], 300)
+    radii = rng.uniform(*_PERC_RANGE, 300)
     assert _pair_set(pos, radii, w, h, False) == _brute_pair_set(pos, radii, w, h, False)
 
     # Degenerate tiny worlds: a single cell (150 // 80 = 1) and a 2-cell axis
     # (170 // 80 = 2), where wrap offsets would alias cells if not deduplicated.
     for w in (150, 170):
         pos = rng.uniform(0, w, (60, 2))
-        radii = rng.uniform(*GENE_RANGES["perception"], 60)
+        radii = rng.uniform(*_PERC_RANGE, 60)
         for wrap in (True, False):
             assert _pair_set(pos, radii, w, w, wrap) == _brute_pair_set(pos, radii, w, w, wrap)
 
@@ -633,7 +639,7 @@ def test_nearest_shark_matches_loop():
             assert np.allclose(offset[a], deltas[idx[a]])
 
 
-def _oracle_accel(a, pos, vel, genes, shark, cfg):
+def _oracle_accel(a, pos, vel, shark, cfg):
     """Scalar reference for one fish's acceleration — a straight port of the
     original per-object Boid rules (separation/alignment/cohesion/flee +
     Reynolds steering), kept as an oracle for the vectorized pipeline."""
@@ -644,7 +650,7 @@ def _oracle_accel(a, pos, vel, genes, shark, cfg):
         if n2 == 0.0:
             return (0.0, 0.0)
         norm = math.sqrt(n2)
-        ms = genes[a, F_MAXSPD]
+        ms = cfg.fish_max_speed
         sx, sy = dx / norm * ms - vel[a, 0], dy / norm * ms - vel[a, 1]
         s2 = sx * sx + sy * sy
         if s2 > cfg.max_force**2:
@@ -657,7 +663,7 @@ def _oracle_accel(a, pos, vel, genes, shark, cfg):
         for b in range(len(pos))
         if b != a
         and (pos[b, 0] - pos[a, 0]) ** 2 + (pos[b, 1] - pos[a, 1]) ** 2
-        <= genes[a, F_PERC] ** 2
+        <= cfg.fish_perception**2
     ]
 
     sep = [0.0, 0.0]
@@ -685,14 +691,18 @@ def _oracle_accel(a, pos, vel, genes, shark, cfg):
 
     fx, fy = pos[a, 0] - shark[0], pos[a, 1] - shark[1]
     fd2 = fx * fx + fy * fy
-    radius = cfg.flee_radius * genes[a, F_FEAR]
-    flee = (fx / fd2, fy / fd2) if 0.0 < fd2 <= radius * radius else (0.0, 0.0)
+    flee = (
+        (fx / fd2, fy / fd2)
+        if 0.0 < fd2 <= cfg.flee_radius * cfg.flee_radius
+        else (0.0, 0.0)
+    )
 
     total = [0.0, 0.0]
-    for w_col, desired in zip((F_WSEP, F_WALI, F_WCOH, F_WFLEE), (sep, ali, coh, flee)):
+    weights = (cfg.fish_w_sep, cfg.fish_w_ali, cfg.fish_w_coh, cfg.fish_w_flee)
+    for weight, desired in zip(weights, (sep, ali, coh, flee)):
         sx, sy = steer(desired)
-        total[0] += genes[a, w_col] * sx
-        total[1] += genes[a, w_col] * sy
+        total[0] += weight * sx
+        total[1] += weight * sy
     return total
 
 
@@ -702,37 +712,33 @@ def test_steering_matches_scalar_reference():
     n, w, h = 60, 600, 400
     world = np.array([float(w), float(h)])
     pos = rng.uniform(0, (w, h), (n, 2))
-    genes = random_genes(rng, FISH_SPEC, n)
     heading = rng.uniform(0, 2 * math.pi, n)
-    speed = rng.uniform(cfg.min_speed, genes[:, F_MAXSPD])
+    speed = rng.uniform(cfg.min_speed, cfg.fish_max_speed, n)
     vel = np.stack([np.cos(heading), np.sin(heading)], axis=1) * speed[:, None]
     shark = np.array([300.0, 200.0])
 
-    grid = build_grid(pos, w, h, _CELL_MIN, wrap=False)
-    i, j, rel, d2 = perception_pairs(grid, pos, genes[:, F_PERC], world, wrap=False)
+    grid = build_grid(pos, w, h, cfg.fish_perception, wrap=False)
+    i, j, rel, d2 = perception_pairs(
+        grid, pos, np.full(n, cfg.fish_perception), world, wrap=False
+    )
     _idx, flee_offset, flee_d2 = nearest_points(pos, shark[None, :], world, wrap=False)
-    accel = fish_accelerations(vel, genes, i, j, rel, d2, flee_offset, flee_d2, cfg)
+    accel = fish_accelerations(vel, i, j, rel, d2, flee_offset, flee_d2, cfg)
 
     for a in range(n):
-        assert np.allclose(accel[a], _oracle_accel(a, pos, vel, genes, shark, cfg), atol=1e-9)
+        assert np.allclose(accel[a], _oracle_accel(a, pos, vel, shark, cfg), atol=1e-9)
 
 
 def test_state_compact_and_append():
     rng = np.random.default_rng(1)
     fish = FishState(capacity=5)
     pos = rng.uniform(0, 100, (4, 2))
-    fish.append(
-        pos=pos,
-        vel=np.zeros((4, 2)),
-        genes=random_genes(rng, FISH_SPEC, 4),
-        generation=np.arange(4),
-        age=np.arange(4) * 10,
-    )
+    vel = np.tile(np.arange(4, dtype=float)[:, None], (1, 2))
+    fish.append(pos=pos, vel=vel)
     assert len(fish) == 4
 
     removed = fish.compact(np.array([True, False, True, False]))
     assert removed == 2 and len(fish) == 2
-    assert np.array_equal(fish.age, [0, 20])  # survivors kept their order
+    assert np.allclose(fish.vel[:, 0], [0.0, 2.0])  # survivors kept their order
     assert np.allclose(fish.pos, pos[[0, 2]])
 
     # Views write through to the buffers.
@@ -740,13 +746,7 @@ def test_state_compact_and_append():
     assert np.allclose(fish.pos, pos[[0, 2]] + 1.0)
 
     # Appending past capacity trips the guard assert.
-    row = dict(
-        pos=np.zeros((4, 2)),
-        vel=np.zeros((4, 2)),
-        genes=random_genes(rng, FISH_SPEC, 4),
-        generation=np.zeros(4, dtype=np.int64),
-        age=np.zeros(4, dtype=np.int64),
-    )
+    row = dict(pos=np.zeros((4, 2)), vel=np.zeros((4, 2)))
     try:
         fish.append(**row)
         assert False, "expected the capacity assert to fire"
@@ -756,25 +756,24 @@ def test_state_compact_and_append():
 
 def test_mutation_rate_zero_is_identity():
     rng = np.random.default_rng(0)
-    parents = random_genes(rng, FISH_SPEC, 50)
-    children = mutate_genes(rng, FISH_SPEC, parents, rate=0.0, sigma=0.5)
+    parents = random_genes(rng, SHARK_SPEC, 50)
+    children = mutate_genes(rng, SHARK_SPEC, parents, rate=0.0, sigma=0.5)
     assert np.array_equal(children, parents)
 
 
 def test_mutated_gene_arrays_stay_in_range():
     rng = np.random.default_rng(7)
-    for spec in (FISH_SPEC, SHARK_SPEC):
-        parents = random_genes(rng, spec, 500)
-        children = mutate_genes(rng, spec, parents, rate=1.0, sigma=0.5)
-        for genes in (parents, children):
-            assert np.all(genes >= spec.lo) and np.all(genes <= spec.hi)
+    parents = random_genes(rng, SHARK_SPEC, 500)
+    children = mutate_genes(rng, SHARK_SPEC, parents, rate=1.0, sigma=0.5)
+    for genes in (parents, children):
+        assert np.all(genes >= SHARK_SPEC.lo) and np.all(genes <= SHARK_SPEC.hi)
 
 
 def test_gene_fractions_clipped():
-    genes = np.tile(FISH_SPEC.mid(), (3, 1))
-    genes[1, F_MAXSPD] = 99.0  # beyond the (2, 5) range
-    genes[2, F_MAXSPD] = -99.0
-    fracs = gene_fractions(genes, FISH_SPEC, "max_speed")
+    genes = np.tile(SHARK_SPEC.mid(), (3, 1))
+    genes[1, S_MAXSPD] = 99.0  # beyond the (3, 6) range
+    genes[2, S_MAXSPD] = -99.0
+    fracs = gene_fractions(genes, SHARK_SPEC, "max_speed")
     assert np.allclose(fracs, [0.5, 1.0, 0.0])
 
 

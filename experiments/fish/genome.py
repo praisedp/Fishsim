@@ -1,4 +1,7 @@
-"""Heritable traits for the two evolving species: fish and sharks.
+"""Heritable traits for the one evolving species: sharks.
+
+(Fish are plain rule-based boids — their shared behaviour knobs live in
+``config.py``, and nothing about them evolves.)
 
 Genes live in numpy arrays, one **row per animal, one column per gene** — the
 struct-of-arrays layout the whole engine uses. A species is described by a
@@ -7,12 +10,12 @@ struct-of-arrays layout the whole engine uses. A species is described by a
 populations at once.
 
 Reproduction copies gene rows with small random tweaks (:func:`mutate_genes`);
-predation and starvation cull the ones that behave badly, so the gene values drift
-toward whatever survives. Fish evolve to evade; sharks evolve to hunt.
+predation and starvation cull the ones that behave badly, so the gene values
+drift toward whatever survives. Two-parent breeding exists as
+:func:`crossover_genes` (uniform crossover); the sim uses it when reseeding
+sharks from the hall-of-fame.
 
-The ``*_RANGES`` dicts remain the single source of truth for each species' gene
-bounds. Two-parent breeding exists as :func:`crossover_genes` (uniform
-crossover); the sim uses it when reseeding sharks from the hall-of-fame.
+``SHARK_GENE_RANGES`` remains the single source of truth for the gene bounds.
 """
 
 from __future__ import annotations
@@ -20,17 +23,6 @@ from __future__ import annotations
 import numpy as np
 
 # --- Gene declarations (single source of truth) -------------------------------
-
-# Inclusive (min, max) bounds per fish gene.
-GENE_RANGES: dict[str, tuple[float, float]] = {
-    "w_sep": (0.0, 3.0),         # separation weight
-    "w_ali": (0.0, 3.0),         # alignment weight
-    "w_coh": (0.0, 3.0),         # cohesion weight
-    "w_flee": (0.0, 6.0),        # flee-from-shark weight
-    "perception": (20.0, 80.0),  # how far it sees neighbours
-    "max_speed": (2.0, 5.0),     # top speed
-    "fear": (0.5, 2.0),          # multiplies the base flee radius
-}
 
 # The shark's *body*; its behaviour lives in an evolved neural net (brain.py)
 # whose throttle output picks a speed between the two speed genes each tick.
@@ -44,7 +36,6 @@ SHARK_GENE_RANGES: dict[str, tuple[float, float]] = {
 }
 
 # Order genes appear in the UI / averages. Same as dict order (Python 3.7+).
-GENE_NAMES: tuple[str, ...] = tuple(GENE_RANGES.keys())
 SHARK_GENE_NAMES: tuple[str, ...] = tuple(SHARK_GENE_RANGES.keys())
 
 
@@ -78,19 +69,10 @@ class GeneSpec:
         return (self.lo + self.hi) / 2
 
 
-FISH_SPEC = GeneSpec(GENE_RANGES)
 SHARK_SPEC = GeneSpec(SHARK_GENE_RANGES)
 
 # Column indices, precomputed once so hot code reads like prose instead of
-# doing dict lookups: genes[:, F_MAXSPD] is a whole population's top speeds.
-F_WSEP = FISH_SPEC.col("w_sep")
-F_WALI = FISH_SPEC.col("w_ali")
-F_WCOH = FISH_SPEC.col("w_coh")
-F_WFLEE = FISH_SPEC.col("w_flee")
-F_PERC = FISH_SPEC.col("perception")
-F_MAXSPD = FISH_SPEC.col("max_speed")
-F_FEAR = FISH_SPEC.col("fear")
-
+# doing dict lookups: genes[:, S_MAXSPD] is a whole population's top speeds.
 S_MAXSPD = SHARK_SPEC.col("max_speed")
 S_MINSPD = SHARK_SPEC.col("min_speed")
 S_PERC = SHARK_SPEC.col("perception")

@@ -1,9 +1,10 @@
-"""Tunable parameters for the coevolving fish-vs-shark simulation.
+"""Tunable parameters for the fish-vs-shark simulation.
 
-The behavioural knobs that used to live here (fish rule weights, perception, speed;
-the shark's speed) are now *per-animal genes* — see ``genome.py``. What remains is
-the world setup, shared physics, and the genetic-algorithm dials for both species:
-how fish and sharks are born, fed, and culled.
+Fish are plain rule-based boids: every fish shares the flocking weights below —
+no genes, no evolution. Sharks are the evolving species; their *body* knobs are
+per-animal genes (see ``genome.py``) and their behaviour an evolved neural net
+(``brain.py``). What remains here is the world setup, shared physics, the fish
+rule weights, and the shark genetic-algorithm dials.
 """
 
 from dataclasses import dataclass
@@ -14,26 +15,28 @@ class Config:
     # --- World ---
     width: int = 1400
     height: int = 800
-    fps: int = 90
+    fps: int = 60
     num_fish: int = 440  # starting fish population
     num_sharks: int = 20  # starting shark population
     wrap_edges: bool = True  # True = toroidal wrap-around, False = soft bounce
 
     # --- Shared physics (NOT per-animal) ---
-    separation_radius: float = 20.0  # fish personal-space distance
-    min_speed: float = 1.0  # keeps fish drifting so they never freeze
-    max_force: float = 0.18  # fish steering clamp (Reynolds)
+    separation_radius: float = 18.0  # fish personal-space distance
+    min_speed: float = 0.2  # keeps fish drifting so they never freeze
+    max_force: float = 0.14  # fish steering clamp (Reynolds)
 
     # --- Predation ---
-    flee_radius: float = 130.0  # base range; each fish scales it by its ``fear`` gene
+    flee_radius: float = 130.0  # range at which a fish starts fleeing a shark
     kill_radius: float = 14.0  # fish within this of a shark get eaten
 
-    # --- Fish genetic algorithm ---
-    maturity_age: int = 100  # ticks before a fish can reproduce
-    repro_prob: float = 0.004  # per-tick chance a mature fish spawns a child
-    mutation_rate: float = 0.5  # per-gene chance of a nudge when breeding
-    mutation_sigma: float = 0.12  # nudge size, as a fraction of each gene's span
-    max_pop: int = 1000  # hard cap on living fish (no floor: true ecosystem)
+    # --- Fish boids (rule-based, no evolution; every fish is identical) ---
+    fish_perception: float = 40.0  # neighbour visibility radius
+    fish_max_speed: float = 5.2  # top speed
+    fish_w_sep: float = 1.7  # separation weight (avoid crowding)
+    fish_w_ali: float = 1.0  # alignment weight (match direction)
+    fish_w_coh: float = 0.9  # cohesion weight (move toward group)
+    fish_w_flee: float = 1.0  # flee-from-shark weight
+    fish_respawn_rate: float = 0.5  # new fish per tick (fractional), up to num_fish
 
     # --- Shark genetic algorithm (energy / hunger driven) ---
     max_sharks: int = 50  # hard cap on living sharks (no floor: they can go extinct)
@@ -41,7 +44,7 @@ class Config:
         15  # random sharks removed whenever the population hits the cap (0 = off)
     )
     shark_start_energy: float = 100.0  # energy a fresh/immigrant shark begins with
-    shark_energy_per_fish: float = 15.0  # energy gained per fish eaten
+    shark_energy_per_fish: float = 20.0  # energy gained per fish eaten
     shark_repro_energy: float = 250.0  # energy needed to spawn a child
     shark_birth_cost: float = 150.0  # energy lost from the split at birth
     shark_metab_base: float = 0.04  # baseline energy burned per tick
@@ -78,12 +81,9 @@ class Config:
     # scramble the policy; scale it down further if you grow the brain)
     brain_mutation_sigma: float = 0.15  # nudge size, absolute weight units
 
-    # --- Fish colour ---
-    color_gene: str = "fear"  # which fish gene the colour maps to (cycled with [C])
-
     # --- Edge handling (soft-bounce mode only) ---
-    edge_margin: float = 80.0
-    edge_turn: float = 0.3
+    edge_margin: float = 40.0  # start turning inward this far from a border
+    edge_turn: float = 0.25  # inward velocity nudge per tick inside the margin
 
     # --- Wall obstacles (static geometric shards; both species soft-bounce) ---
     walls_enabled: bool = (

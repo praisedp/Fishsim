@@ -1,6 +1,6 @@
-"""The simulation world: a coevolving ecosystem of fish and sharks.
+"""The simulation world: rule-based fish prey and an evolving shark predator.
 
-This is the genetic-algorithm engine for *both* species. Each tick:
+Each tick:
 
 - **Sharks hunt** by brain: each runs its own evolved neural net (:mod:`brain`)
   over a sector retina of the fish it can see (limited by its ``perception``
@@ -8,13 +8,15 @@ This is the genetic-algorithm engine for *both* species. Each tick:
   genes. Eating a fish restores energy; every tick burns some (sprinting and
   keen sight burn more). Out of energy → the shark starves and dies; well-fed →
   it spawns a mutated child (genes and brain), splitting its energy.
-- **Fish flee** the nearest shark and flock, then mature ones occasionally breed
-  mutated copies of themselves.
+- **Fish** are classic boids — identical, rule-based, non-evolving: the three
+  Reynolds rules plus flee-from-the-nearest-shark, all weighted by shared
+  config knobs. Eaten fish are gone; replacements trickle in at a steady
+  configurable rate (up to ``num_fish``), so the sea slowly refills after a
+  feeding frenzy.
 
-There are no population floors: if the sharks can't catch enough they go extinct and
-the fish fill the sea; if they're too good they eat everything and then starve. Good
-genes — dodging for fish, hunting for sharks — spread on their own. No generations,
-no resets.
+Only the sharks evolve. They have no population floor: if they can't catch
+enough they go extinct (the hall-of-fame rescue rebreeds them); if they're too
+good they thin the sea faster than it refills, and then starve.
 
 Populations live in struct-of-arrays form (:mod:`state`), and every per-tick rule
 below is a whole-population array operation — see :mod:`neighbors` for the pair
@@ -41,10 +43,6 @@ from brain import (
 )
 from config import Config
 from genome import (
-    F_MAXSPD,
-    F_PERC,
-    FISH_SPEC,
-    GENE_NAMES,
     S_MAXSPD,
     S_MINSPD,
     S_PERC,
@@ -61,12 +59,6 @@ from walls import WallField, avoid_all
 
 # Behaviour constants (fixed by design, not evolved or config-tuned).
 SHARK_SPAWN_JITTER = 10.0  # newborn shark's offset from its parent
-FISH_SPAWN_JITTER = 8.0  # newborn fish's offset from its parent
-
-# Cells sized to the largest *fish* perception so a fish's neighbours always live
-# in the 9 surrounding cells. Sharks see much further, but their prey search is a
-# dense shark×fish distance matrix, so it never touches the grid.
-CELL_MIN = float(FISH_SPEC.hi[F_PERC])
 
 
 class Simulation:
@@ -78,7 +70,10 @@ class Simulation:
         # Static obstacles, built once (they never move) — seeded for reproducibility.
         self.rebuild_walls()
 
-        self.fish = FishState(capacity=max(cfg.max_pop, cfg.num_fish))
+        # Small capacity floor so tests can hand-insert fish into an empty sea;
+        # the sim itself never spawns past num_fish.
+        self.fish = FishState(capacity=max(cfg.num_fish, 8))
+        self._respawn_debt = 0.0  # fractional fish owed by the trickle respawn
         # One brain layout per sim, derived from config — it sizes the shark
         # state's weight buffer and the observation every net is run on.
         self.brain_spec = BrainSpec(cfg.shark_memory_frames, cfg.shark_hidden)
@@ -115,16 +110,9 @@ class Simulation:
     def _spawn_initial_populations(self) -> None:
         cfg = self.cfg
         n = cfg.num_fish
-        genes = random_genes(self.rng, FISH_SPEC, n)
         self.fish.append(
             pos=self.rng.uniform(0, self.world, (n, 2)),
-            vel=self._random_headings(genes[:, F_MAXSPD]),
-            genes=genes,
-            generation=np.zeros(n, dtype=np.int64),
-            # Seed a spread of ages so a founding population isn't uniformly
-            # immature — some can breed right away instead of all waiting out
-            # maturity together.
-            age=self.rng.integers(0, cfg.maturity_age + 1, n),
+            vel=self._random_headings(n),
         )
 
         s = cfg.num_sharks
@@ -147,11 +135,11 @@ class Simulation:
         starts blind to the past ("saw nothing before")."""
         return np.zeros((k, self.cfg.shark_memory_frames, N_SENSES))
 
-    def _random_headings(self, max_speeds: np.ndarray) -> np.ndarray:
-        """``(k, 2)`` velocities: random directions, speeds between the floor and
-        each fish's own top speed."""
-        angle = self.rng.uniform(0, 2 * np.pi, len(max_speeds))
-        speed = self.rng.uniform(self.cfg.min_speed, max_speeds)
+    def _random_headings(self, k: int) -> np.ndarray:
+        """``(k, 2)`` fish velocities: random directions, speeds between the
+        drift floor and the shared top speed."""
+        angle = self.rng.uniform(0, 2 * np.pi, k)
+        speed = self.rng.uniform(self.cfg.min_speed, self.cfg.fish_max_speed, k)
         return np.stack([np.cos(angle), np.sin(angle)], axis=1) * speed[:, None]
 
     def _shark_spawn_vel(self, genes: np.ndarray) -> np.ndarray:
@@ -162,21 +150,14 @@ class Simulation:
         speed = np.minimum(genes[:, S_MINSPD], genes[:, S_MAXSPD])
         return np.stack([np.cos(angle), np.sin(angle)], axis=1) * speed[:, None]
 
-    def add_fish(self, pos, genes=None, vel=None, age: int = 0, generation: int = 0) -> None:
-        """Insert a single fish (mid-range genes by default) — mainly for tests."""
-        genes = FISH_SPEC.mid() if genes is None else np.asarray(genes, dtype=float)
+    def add_fish(self, pos, vel=None) -> None:
+        """Insert a single fish — mainly for tests."""
         vel = (
-            self._random_headings(np.array([genes[F_MAXSPD]]))
+            self._random_headings(1)
             if vel is None
             else np.asarray(vel, dtype=float)[None]
         )
-        self.fish.append(
-            pos=np.asarray(pos, dtype=float)[None],
-            vel=vel,
-            genes=genes[None],
-            generation=np.array([generation]),
-            age=np.array([age]),
-        )
+        self.fish.append(pos=np.asarray(pos, dtype=float)[None], vel=vel)
 
     def add_shark(self, pos, genes=None, energy: float | None = None, weights=None) -> None:
         """Insert a single shark (mid-range genes, random brain by default) —
@@ -318,9 +299,15 @@ class Simulation:
         # Fish pass 1 (read): flock with visible neighbours, flee the nearest shark.
         if len(self.fish):
             fish = self.fish
-            grid = build_grid(fish.pos, cfg.width, cfg.height, CELL_MIN, cfg.wrap_edges)
+            grid = build_grid(
+                fish.pos, cfg.width, cfg.height, cfg.fish_perception, cfg.wrap_edges
+            )
             i, j, rel, d2 = perception_pairs(
-                grid, fish.pos, fish.genes[:, F_PERC], self.world, cfg.wrap_edges
+                grid,
+                fish.pos,
+                np.full(len(fish), cfg.fish_perception),
+                self.world,
+                cfg.wrap_edges,
             )
             if len(self.sharks):
                 _, flee_offset, flee_d2 = nearest_points(
@@ -329,20 +316,21 @@ class Simulation:
             else:
                 flee_offset = flee_d2 = None  # no sharks alive -> nothing to flee
             accel = fish_accelerations(
-                fish.vel, fish.genes, i, j, rel, d2, flee_offset, flee_d2, cfg
+                fish.vel, i, j, rel, d2, flee_offset, flee_d2, cfg
             )
 
             # Pass 2 (write): integrate, then resolve walls and world edges.
             self._integrate_fish(accel)
-            self._apply_walls(self.fish, max_speed=fish.genes[:, F_MAXSPD])
+            self._apply_walls(self.fish, max_speed=cfg.fish_max_speed)
             self._apply_edges_fish()
 
-        # Genetic algorithm: predation feeds sharks, then births and deaths.
+        # Predation feeds the sharks, then their GA births and deaths run and
+        # the sea trickle-refills with fresh fish.
         self._predate()
         self._shark_metabolise_and_die()
         self._shark_random_cull()
         self._shark_reproduce()
-        self._fish_reproduce()
+        self._fish_respawn()
         self._update_hall_of_fame()
         self._update_stats()
 
@@ -554,30 +542,24 @@ class Simulation:
         )
         self.shark_births += k
 
-    def _fish_reproduce(self) -> None:
-        """Mature fish occasionally spawn a mutated child nearby (asexual)."""
+    def _fish_respawn(self) -> None:
+        """Trickle the sea back up to ``num_fish`` after predation.
+
+        Fish don't breed — eaten ones are simply replaced at a steady
+        ``fish_respawn_rate`` per tick (fractional rates accumulate as debt),
+        each appearing at a random spot with a random heading."""
         cfg = self.cfg
-        fish = self.fish
-        headroom = cfg.max_pop - len(fish)
-        if headroom <= 0 or not len(fish):
+        headroom = cfg.num_fish - len(self.fish)
+        if headroom <= 0:
             return
-        breeding = (fish.age >= cfg.maturity_age) & (
-            self.rng.random(len(fish)) < cfg.repro_prob
-        )
-        parents = np.flatnonzero(breeding)[:headroom]
-        if not parents.size:
+        self._respawn_debt += cfg.fish_respawn_rate
+        k = min(int(self._respawn_debt), headroom)
+        if k <= 0:
             return
-        k = parents.size
-        child_genes = mutate_genes(
-            self.rng, FISH_SPEC, fish.genes[parents], cfg.mutation_rate, cfg.mutation_sigma
-        )
-        jitter = self.rng.uniform(-FISH_SPAWN_JITTER, FISH_SPAWN_JITTER, (k, 2))
+        self._respawn_debt -= k
         self.fish.append(
-            pos=fish.pos[parents] + jitter,
-            vel=self._random_headings(child_genes[:, F_MAXSPD]),
-            genes=child_genes,
-            generation=fish.generation[parents] + 1,
-            age=np.zeros(k, dtype=np.int64),
+            pos=self.rng.uniform(0, self.world, (k, 2)),
+            vel=self._random_headings(k),
         )
         self.births += k
 
@@ -587,19 +569,27 @@ class Simulation:
         """Apply the tick's accelerations: speed-clamped velocity, then position."""
         cfg = self.cfg
         fish = self.fish
-        vel = limit_norm(fish.vel + accel, fish.genes[:, F_MAXSPD])
+        vel = limit_norm(fish.vel + accel, cfg.fish_max_speed)
         # Keep a minimum speed so isolated fish keep drifting instead of freezing.
         speed2 = np.einsum("nc,nc->n", vel, vel)
-        slow = (speed2 > 0.0) & (speed2 < cfg.min_speed**2)
+        slow = (speed2 > EPS) & (speed2 < cfg.min_speed**2)
         if slow.any():
             vel[slow] *= cfg.min_speed / np.sqrt(speed2[slow])[:, None]
+        # A fully cancelled velocity (rules exactly opposing the motion) keeps
+        # drifting along the previous heading instead of freezing in place.
+        dead = speed2 <= EPS
+        if dead.any():
+            old = fish.vel[dead]
+            old_speed = np.sqrt(np.einsum("nc,nc->n", old, old))
+            live = old_speed > EPS
+            rows = np.flatnonzero(dead)[live]
+            vel[rows] = old[live] / old_speed[live][:, None] * cfg.min_speed
         fish.vel[:] = vel
         fish.pos[:] += vel
-        fish.age[:] += 1
 
     # --- World geometry: walls and edges -------------------------------------
 
-    def _apply_walls(self, state, max_speed: np.ndarray | None = None) -> None:
+    def _apply_walls(self, state, max_speed: float | None = None) -> None:
         """Soft-bounce a population off any nearby shard.
 
         A velocity nudge along the outward wall normal (stronger up close) steers
@@ -607,8 +597,8 @@ class Simulation:
         positional ejection back out. Sharks need that ejection because their
         velocity is rewritten from scratch each tick, so a nudge alone would be
         forgotten — they'd end up sliding along a wall instead. Pass ``max_speed``
-        (per animal) to re-clamp nudged rows; fish keep their gene's speed cap
-        intact, sharks are left unclamped like the rest of their motion.
+        to re-clamp nudged rows; fish keep their shared speed cap intact, sharks
+        are left unclamped like the rest of their motion.
         """
         cfg = self.cfg
         if not cfg.walls_enabled or not len(state):
@@ -619,7 +609,7 @@ class Simulation:
         if max_speed is not None:
             pushed = np.flatnonzero(np.einsum("nc,nc->n", push, push) > 0.0)
             if pushed.size:
-                state.vel[pushed] = limit_norm(state.vel[pushed], max_speed[pushed])
+                state.vel[pushed] = limit_norm(state.vel[pushed], max_speed)
 
     def _confine_sharks(self) -> None:
         """Keep sharks in the world: toroidal wrap, or reflect off the borders."""
@@ -639,38 +629,46 @@ class Simulation:
             # Toroidal wrap-around: off one edge -> back on the opposite.
             pos %= self.world
         else:
-            # Soft bounce: steer back inward near the borders.
+            # Soft bounce: steer back inward near the borders, re-clamping any
+            # turned fish to the shared top speed.
+            turned = np.zeros(len(self.fish), dtype=bool)
             for axis, limit in enumerate(self.world):
                 low = pos[:, axis] < cfg.edge_margin
                 high = ~low & (pos[:, axis] > limit - cfg.edge_margin)
                 vel[low, axis] += cfg.edge_turn
                 vel[high, axis] -= cfg.edge_turn
+                turned |= low | high
+            rows = np.flatnonzero(turned)
+            if rows.size:
+                vel[rows] = limit_norm(vel[rows], cfg.fish_max_speed)
+            # Hard safety bounce at the actual edge: clamp the position onto the
+            # border and reflect the velocity component back inward.
+            for axis, limit in enumerate(self.world):
+                under = pos[:, axis] < 0.0
+                over = pos[:, axis] > limit
+                pos[under, axis] = 0.0
+                vel[under, axis] = np.abs(vel[under, axis])
+                pos[over, axis] = limit
+                vel[over, axis] = -np.abs(vel[over, axis])
 
     # --- HUD statistics -----------------------------------------------------
 
     def _update_stats(self) -> None:
+        """Population counts for both species, plus the shark GA's live means
+        (per-gene averages, lineage depth, energy) — fish have nothing evolving
+        to report."""
+        sharks = self.sharks
+        alive = len(sharks) > 0
         stats: dict[str, float] = {
             "population": len(self.fish),
             "births": self.births,
             "deaths": self.deaths,
-            "shark_population": len(self.sharks),
+            "shark_population": len(sharks),
             "shark_births": self.shark_births,
             "shark_deaths": self.shark_deaths,
+            "shark_generation": float(sharks.generation.mean()) if alive else 0.0,
+            "shark_energy": float(sharks.energy.mean()) if alive else 0.0,
         }
-        self._average_genes(stats, self.fish, GENE_NAMES, prefix="", lineage="generation")
-        self._average_genes(
-            stats, self.sharks, SHARK_GENE_NAMES, prefix="shark_",
-            lineage="shark_generation", energy_key="shark_energy",
-        )
+        for column, name in enumerate(SHARK_GENE_NAMES):
+            stats["shark_" + name] = float(sharks.genes[:, column].mean()) if alive else 0.0
         self.stats = stats
-
-    @staticmethod
-    def _average_genes(stats, state, gene_names, prefix, lineage, energy_key=None):
-        """Fill ``stats`` with the mean of each gene (+ lineage / energy) over a
-        living population, or zeros when it's empty."""
-        alive = len(state) > 0
-        stats[lineage] = float(state.generation.mean()) if alive else 0.0
-        for column, name in enumerate(gene_names):
-            stats[prefix + name] = float(state.genes[:, column].mean()) if alive else 0.0
-        if energy_key is not None:
-            stats[energy_key] = float(state.energy.mean()) if alive else 0.0

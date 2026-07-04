@@ -43,8 +43,9 @@ def main() -> None:
     pinned = Config(
         num_fish=1000,
         num_sharks=50,
+        max_sharks=50,
         kill_radius=0.0,
-        repro_prob=0.0,
+        shark_cull_count=0,
         shark_metab_base=0.0,
         shark_metab_speed_k=0.0,
         shark_metab_perc_k=0.0,

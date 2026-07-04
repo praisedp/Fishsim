@@ -21,7 +21,7 @@ from __future__ import annotations
 import numpy as np
 
 from brain import N_SENSES
-from genome import FISH_SPEC, SHARK_SPEC
+from genome import SHARK_SPEC
 
 
 class _SoABase:
@@ -66,15 +66,13 @@ class _SoABase:
 
 
 class FishState(_SoABase):
-    """The fish population: motion, genes, and breeding bookkeeping."""
+    """The fish population: pure motion — rule-based boids carry no genes or
+    breeding bookkeeping."""
 
     def __init__(self, capacity: int):
         super().__init__(capacity, {
             "pos": ((2,), np.float64),
             "vel": ((2,), np.float64),
-            "genes": ((FISH_SPEC.count,), np.float64),
-            "generation": ((), np.int64),
-            "age": ((), np.int64),
         })
 
     @property
@@ -84,18 +82,6 @@ class FishState(_SoABase):
     @property
     def vel(self) -> np.ndarray:
         return self._view("vel")
-
-    @property
-    def genes(self) -> np.ndarray:
-        return self._view("genes")
-
-    @property
-    def generation(self) -> np.ndarray:
-        return self._view("generation")
-
-    @property
-    def age(self) -> np.ndarray:
-        return self._view("age")
 
 
 class SharkState(_SoABase):
