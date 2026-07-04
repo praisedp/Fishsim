@@ -40,7 +40,6 @@ MAX_LAG_TICKS = 3
 
 # Colours
 OCEAN = (12, 28, 54)
-KILL_RING = (220, 70, 70, 60)
 HUD = (180, 200, 220)
 WALL = (110, 118, 126)  # muted stony grey
 WALL_EDGE = (70, 76, 82)  # darker facet outline
@@ -114,14 +113,13 @@ def draw_fish_all(surface: pygame.Surface, sim: Simulation, pos: np.ndarray) -> 
 
 def draw_sharks(
     surface: pygame.Surface,
-    overlay: pygame.Surface,
     sim: Simulation,
     gene: str,
     pos: np.ndarray,
 ) -> None:
     """Every shark as a kite — two triangles meeting at the crossbar — pointing
-    along its velocity, gene-tinted, with its kill radius ringed on the overlay.
-    ``pos`` is where to draw (the render-interpolated positions)."""
+    along its velocity, gene-tinted. ``pos`` is where to draw (the
+    render-interpolated positions)."""
     sharks = sim.sharks
     if not len(sharks):
         return
@@ -134,13 +132,11 @@ def draw_sharks(
     tails = (pos - heading * SHARK_TAIL).tolist()
     fractions = gene_fractions(sharks.genes, SHARK_SPEC, gene)
     energy_fracs = sharks.energy / cfg.shark_repro_energy
-    centers = pos.tolist()
     for k in range(len(sharks)):
         color = shark_color(fractions[k], energy_fracs[k])
         shade = color.lerp(pygame.Color(0, 0, 0), SHARK_BACK_SHADE)
         pygame.draw.polygon(surface, color, (noses[k], lefts[k], rights[k]))
         pygame.draw.polygon(surface, shade, (tails[k], lefts[k], rights[k]))
-        pygame.draw.circle(overlay, KILL_RING, centers[k], int(cfg.kill_radius), 1)
 
 
 def main() -> None:
@@ -150,9 +146,6 @@ def main() -> None:
     pygame.display.set_caption("Coevolving Boids — fish vs. sharks")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("monospace", 14)
-    # One reusable transparent overlay (kill rings); cleared, not reallocated
-    # per frame — only when the window is resized.
-    overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
 
     sim = Simulation(cfg)
     paused = False
@@ -176,9 +169,8 @@ def main() -> None:
                 running = False
             elif event.type == pygame.VIDEORESIZE:
                 # The display surface already tracks the window; the sim world
-                # and the alpha overlay have to be told the new size.
+                # has to be told the new size.
                 screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
-                overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
                 sim.resize(*screen.get_size())
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
@@ -220,7 +212,6 @@ def main() -> None:
 
         # --- Render ---
         screen.fill(OCEAN)
-        overlay.fill((0, 0, 0, 0))
 
         fish_pos = interp_positions(
             sim.fish.prev_pos, sim.fish.pos, sim.world, cfg.wrap_edges, alpha
@@ -231,9 +222,8 @@ def main() -> None:
         if cfg.walls_enabled:
             draw_walls(screen, sim.walls)
         draw_fish_all(screen, sim, fish_pos)
-        draw_sharks(screen, overlay, sim, shark_gene, shark_pos)
+        draw_sharks(screen, sim, shark_gene, shark_pos)
 
-        screen.blit(overlay, (0, 0))
         _draw_hud(screen, font, sim, cfg, clock, manual, shark_gene)
 
         pygame.display.flip()
