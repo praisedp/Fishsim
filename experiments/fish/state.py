@@ -42,7 +42,13 @@ class _SoABase:
         return self._fields[name][: self.n]
 
     def append(self, **rows: np.ndarray) -> None:
-        """Add ``k`` newborn rows (every field required, each shaped ``(k, ...)``)."""
+        """Add ``k`` newborn rows (every field required, each shaped ``(k, ...)``).
+
+        ``prev_pos`` — the render-interpolation anchor — may be omitted and
+        defaults to ``pos``: a newborn is drawn at its spawn point, not lerped
+        in from somewhere else."""
+        if "prev_pos" in self._fields:
+            rows.setdefault("prev_pos", rows["pos"])
         assert rows.keys() == self._fields.keys(), "append() must supply every field"
         k = len(next(iter(rows.values())))
         assert self.n + k <= self.capacity, "population cap should prevent overflow"
@@ -72,12 +78,17 @@ class FishState(_SoABase):
     def __init__(self, capacity: int):
         super().__init__(capacity, {
             "pos": ((2,), np.float64),
+            "prev_pos": ((2,), np.float64),
             "vel": ((2,), np.float64),
         })
 
     @property
     def pos(self) -> np.ndarray:
         return self._view("pos")
+
+    @property
+    def prev_pos(self) -> np.ndarray:
+        return self._view("prev_pos")
 
     @property
     def vel(self) -> np.ndarray:
@@ -93,6 +104,7 @@ class SharkState(_SoABase):
     def __init__(self, capacity: int, weight_count: int, memory_frames: int):
         super().__init__(capacity, {
             "pos": ((2,), np.float64),
+            "prev_pos": ((2,), np.float64),
             "vel": ((2,), np.float64),
             "genes": ((SHARK_SPEC.count,), np.float64),
             "brain": ((weight_count,), np.float64),
@@ -105,6 +117,10 @@ class SharkState(_SoABase):
     @property
     def pos(self) -> np.ndarray:
         return self._view("pos")
+
+    @property
+    def prev_pos(self) -> np.ndarray:
+        return self._view("prev_pos")
 
     @property
     def vel(self) -> np.ndarray:

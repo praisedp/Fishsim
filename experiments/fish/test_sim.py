@@ -786,6 +786,67 @@ def test_walls_no_spurious_far_push():
     assert not push.any() and not eject.any()
 
 
+# --- Render interpolation (fixed timestep: tps decoupled from fps) -----------
+
+
+def test_interp_positions_endpoints_and_plain_lerp():
+    from sim import interp_positions
+
+    world = np.array([500.0, 400.0])
+    prev = np.array([[100.0, 100.0]])
+    pos = np.array([[110.0, 90.0]])
+    for wrap in (True, False):
+        assert np.allclose(interp_positions(prev, pos, world, wrap, 0.0), prev)
+        assert np.allclose(interp_positions(prev, pos, world, wrap, 1.0), pos)
+    assert np.allclose(
+        interp_positions(prev, pos, world, False, 0.5), [[105.0, 95.0]]
+    )
+
+
+def test_interp_positions_slides_through_a_wrapped_edge():
+    from sim import interp_positions
+
+    world = np.array([500.0, 400.0])
+    prev = np.array([[498.0, 200.0]])  # about to cross the right edge...
+    pos = np.array([[2.0, 200.0]])  # ...and wrapped to the left one
+    mid = interp_positions(prev, pos, world, True, 0.5)
+    assert np.allclose(mid, [[0.0, 200.0]])  # through the edge, not mid-screen
+    assert np.all(mid >= 0.0) and np.all(mid < world)
+
+
+def test_prev_pos_pairs_with_pos_through_compaction():
+    cfg = Config(num_fish=0, num_sharks=0, fish_respawn_rate=0.0)
+    sim = Simulation(cfg, seed=1)
+    # A shark parked on one fish; a far-away survivor we track across the eat.
+    sim.add_fish((100.0, 100.0), vel=(0.0, 0.0))  # gets eaten (row 0)
+    sim.add_fish((400.0, 300.0), vel=(1.0, 0.0))  # survives, becomes row 0
+    sim.add_shark((100.0, 100.0), energy=50.0)
+    survivor_before = sim.fish.pos[1].copy()
+    sim.step()
+    assert len(sim.fish) == 1  # the parked fish was eaten and compacted away
+    assert np.allclose(sim.fish.prev_pos[0], survivor_before)  # still paired
+    assert not np.allclose(sim.fish.pos[0], sim.fish.prev_pos[0])  # it moved
+
+
+def test_newborns_get_prev_pos_equal_to_pos():
+    cfg = Config(num_fish=10, num_sharks=3)
+    sim = Simulation(cfg, seed=2)
+    assert np.array_equal(sim.fish.prev_pos, sim.fish.pos)
+    assert np.array_equal(sim.sharks.prev_pos, sim.sharks.pos)
+    empty = Simulation(Config(num_fish=0, num_sharks=0), seed=2)
+    empty.add_fish((50.0, 50.0))
+    assert np.allclose(empty.fish.prev_pos[-1], (50.0, 50.0))
+
+
+def test_resize_resets_prev_pos_to_pos():
+    cfg = Config(num_fish=40, num_sharks=4, wrap_edges=True, width=800, height=600)
+    sim = Simulation(cfg, seed=3)
+    sim.step()
+    sim.resize(300, 200)
+    assert np.array_equal(sim.fish.prev_pos, sim.fish.pos)
+    assert np.array_equal(sim.sharks.prev_pos, sim.sharks.pos)
+
+
 # --- Window resize ------------------------------------------------------------
 
 

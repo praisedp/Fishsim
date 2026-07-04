@@ -15,7 +15,8 @@ class Config:
     # --- World ---
     width: int = 1400
     height: int = 800
-    fps: int = 60
+    tps: int = 60  # simulation ticks per second — world speed ([T] cycles it)
+    fps: int = 120  # render frames per second — smoothness only ([F] cycles it)
     num_fish: int = 440  # starting fish population
     num_sharks: int = 20  # starting shark population
     wrap_edges: bool = True  # True = toroidal wrap-around, False = soft bounce

@@ -61,6 +61,25 @@ from walls import WallField, avoid_all
 SHARK_SPAWN_JITTER = 10.0  # newborn shark's offset from its parent
 
 
+def interp_positions(
+    prev: np.ndarray, pos: np.ndarray, world: np.ndarray, wrap: bool, alpha: float
+) -> np.ndarray:
+    """Render positions ``alpha`` (0..1) of the way from last tick to this one.
+
+    The renderer runs faster than the simulation ticks; drawing at the lerped
+    position is what makes the extra frames actually look smoother. In wrap
+    mode the delta takes the shortest toroidal path, so an animal crossing an
+    edge slides through it instead of streaking across the whole screen.
+    """
+    delta = pos - prev
+    if wrap:
+        delta = min_image(delta, world)
+    out = prev + alpha * delta
+    if wrap:
+        out %= world
+    return out
+
+
 class Simulation:
     def __init__(self, cfg: Config, seed: int | None = None):
         self.cfg = cfg
@@ -129,6 +148,8 @@ class Simulation:
                 state.pos[:] %= self.world
             else:
                 np.clip(state.pos, 0.0, self.world, out=state.pos)
+            # A resize is a teleport — don't render-interpolate across it.
+            state.prev_pos[:] = state.pos
         if self.walls.shards:
             kept = [
                 s
@@ -322,6 +343,12 @@ class Simulation:
         shark chase that point; every other shark hunts autonomously.
         """
         cfg = self.cfg
+
+        # Anchor render interpolation: everything alive lerps from where it is
+        # now to wherever this tick moves it. Rows appended mid-step default to
+        # prev_pos = pos (see state.append), and compaction keeps the pairing.
+        self.fish.prev_pos[:] = self.fish.pos
+        self.sharks.prev_pos[:] = self.sharks.pos
 
         # Auto-floor: if the sharks went extinct last tick, reseed a few from the
         # hall-of-fame before the world runs, so their learned brains carry on.

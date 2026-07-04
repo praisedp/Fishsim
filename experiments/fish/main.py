@@ -17,6 +17,8 @@ Controls:
   - O: toggle the geometric wall obstacles (re-scatters a fresh layout when on).
   - R: reset / reseed the world (handy if the sharks have gone extinct).
   - W: toggle wrap-around vs soft-bounce edges.
+  - T: cycle the sim tick rate (world speed) through 30/45/60/90/120 tps.
+  - F: cycle the render frame rate (smoothness only) through the same steps.
   - Space: pause/resume.   Esc / window close: quit.
 """
 
@@ -27,7 +29,14 @@ import pygame
 
 from config import Config
 from genome import SHARK_GENE_NAMES, SHARK_SPEC, gene_fractions
-from sim import Simulation
+from sim import Simulation, interp_positions
+
+# Runtime-cycled caps for both the sim tick rate ([T]) and render rate ([F]).
+SPEED_STEPS = (30, 45, 60, 90, 120)
+# Refuse to fall further than this many ticks behind real time: on a machine
+# that can't sustain the tick rate the world slows down instead of spiraling
+# (each late tick breeding more late ticks).
+MAX_LAG_TICKS = 3
 
 # Colours
 OCEAN = (12, 28, 54)
@@ -83,42 +92,49 @@ def draw_walls(surface: pygame.Surface, walls) -> None:
         pygame.draw.polygon(surface, WALL_EDGE, verts, 1)
 
 
-def draw_fish_all(surface: pygame.Surface, sim: Simulation) -> None:
+def draw_fish_all(surface: pygame.Surface, sim: Simulation, pos: np.ndarray) -> None:
     """Every fish as a small triangle pointing along its velocity.
 
-    The triangle geometry is computed for the whole school in a few array ops;
-    only the unavoidable per-polygon draw call remains a Python loop.
+    ``pos`` is where to draw (the render-interpolated positions), which lags
+    the sim's true state by less than a tick. The triangle geometry is computed
+    for the whole school in a few array ops; only the unavoidable per-polygon
+    draw call remains a Python loop.
     """
     fish = sim.fish
     if not len(fish):
         return
     heading = _headings(fish.vel)
     side = np.stack([-heading[:, 1], heading[:, 0]], axis=1)
-    tips = (fish.pos + heading * FISH_NOSE).tolist()
-    lefts = (fish.pos - heading * FISH_TAIL + side * FISH_HALF_W).tolist()
-    rights = (fish.pos - heading * FISH_TAIL - side * FISH_HALF_W).tolist()
+    tips = (pos + heading * FISH_NOSE).tolist()
+    lefts = (pos - heading * FISH_TAIL + side * FISH_HALF_W).tolist()
+    rights = (pos - heading * FISH_TAIL - side * FISH_HALF_W).tolist()
     for tip, left, right in zip(tips, lefts, rights):
         pygame.draw.polygon(surface, FISH_COLOR, (tip, left, right))
 
 
 def draw_sharks(
-    surface: pygame.Surface, overlay: pygame.Surface, sim: Simulation, gene: str
+    surface: pygame.Surface,
+    overlay: pygame.Surface,
+    sim: Simulation,
+    gene: str,
+    pos: np.ndarray,
 ) -> None:
     """Every shark as a kite — two triangles meeting at the crossbar — pointing
-    along its velocity, gene-tinted, with its kill radius ringed on the overlay."""
+    along its velocity, gene-tinted, with its kill radius ringed on the overlay.
+    ``pos`` is where to draw (the render-interpolated positions)."""
     sharks = sim.sharks
     if not len(sharks):
         return
     cfg = sim.cfg
     heading = _headings(sharks.vel)
     side = np.stack([-heading[:, 1], heading[:, 0]], axis=1)
-    noses = (sharks.pos + heading * SHARK_NOSE).tolist()
-    lefts = (sharks.pos + heading * SHARK_CROSS_FWD + side * SHARK_HALF_W).tolist()
-    rights = (sharks.pos + heading * SHARK_CROSS_FWD - side * SHARK_HALF_W).tolist()
-    tails = (sharks.pos - heading * SHARK_TAIL).tolist()
+    noses = (pos + heading * SHARK_NOSE).tolist()
+    lefts = (pos + heading * SHARK_CROSS_FWD + side * SHARK_HALF_W).tolist()
+    rights = (pos + heading * SHARK_CROSS_FWD - side * SHARK_HALF_W).tolist()
+    tails = (pos - heading * SHARK_TAIL).tolist()
     fractions = gene_fractions(sharks.genes, SHARK_SPEC, gene)
     energy_fracs = sharks.energy / cfg.shark_repro_energy
-    centers = sharks.pos.tolist()
+    centers = pos.tolist()
     for k in range(len(sharks)):
         color = shark_color(fractions[k], energy_fracs[k])
         shade = color.lerp(pygame.Color(0, 0, 0), SHARK_BACK_SHADE)
@@ -142,9 +158,19 @@ def main() -> None:
     paused = False
     manual = False
     shark_gene_idx = SHARK_GENE_NAMES.index(cfg.shark_color_gene)
+    # Snap the configured rates onto the runtime-cycled steps.
+    tps_idx = min(range(len(SPEED_STEPS)), key=lambda i: abs(SPEED_STEPS[i] - cfg.tps))
+    fps_idx = min(range(len(SPEED_STEPS)), key=lambda i: abs(SPEED_STEPS[i] - cfg.fps))
+    cfg.tps, cfg.fps = SPEED_STEPS[tps_idx], SPEED_STEPS[fps_idx]
+    # Fixed-timestep clock: real time owed to the sim. The world always steps
+    # in whole 1/tps ticks; rendering happens as often as fps allows, drawing
+    # partway between ticks (alpha) so extra frames genuinely look smoother.
+    accumulator = 0.0
     running = True
 
     while running:
+        dt = clock.tick(cfg.fps) / 1000.0
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -170,29 +196,47 @@ def main() -> None:
                     sim.rebuild_walls()  # (re)scatter or clear shards
                 elif event.key == pygame.K_b:
                     sim.rescue_sharks(cfg.rescue_count)  # reseed best sharks
+                elif event.key == pygame.K_t:
+                    tps_idx = (tps_idx + 1) % len(SPEED_STEPS)
+                    cfg.tps = SPEED_STEPS[tps_idx]
+                elif event.key == pygame.K_f:
+                    fps_idx = (fps_idx + 1) % len(SPEED_STEPS)
+                    cfg.fps = SPEED_STEPS[fps_idx]
                 elif event.key == pygame.K_r:
                     sim = Simulation(cfg)
 
         shark_gene = SHARK_GENE_NAMES[shark_gene_idx]
 
-        if not paused:
+        tick_dt = 1.0 / cfg.tps
+        if paused:
+            alpha = 1.0  # draw the settled state; time doesn't accrue
+        else:
             target = pygame.mouse.get_pos() if manual else None
-            sim.step(target)
+            accumulator = min(accumulator + dt, MAX_LAG_TICKS * tick_dt)
+            while accumulator >= tick_dt:
+                sim.step(target)
+                accumulator -= tick_dt
+            alpha = accumulator / tick_dt
 
         # --- Render ---
         screen.fill(OCEAN)
         overlay.fill((0, 0, 0, 0))
 
+        fish_pos = interp_positions(
+            sim.fish.prev_pos, sim.fish.pos, sim.world, cfg.wrap_edges, alpha
+        )
+        shark_pos = interp_positions(
+            sim.sharks.prev_pos, sim.sharks.pos, sim.world, cfg.wrap_edges, alpha
+        )
         if cfg.walls_enabled:
             draw_walls(screen, sim.walls)
-        draw_fish_all(screen, sim)
-        draw_sharks(screen, overlay, sim, shark_gene)
+        draw_fish_all(screen, sim, fish_pos)
+        draw_sharks(screen, overlay, sim, shark_gene, shark_pos)
 
         screen.blit(overlay, (0, 0))
         _draw_hud(screen, font, sim, cfg, clock, manual, shark_gene)
 
         pygame.display.flip()
-        clock.tick(cfg.fps)
 
     pygame.quit()
 
@@ -214,9 +258,10 @@ def _draw_hud(screen, font, sim, cfg, clock, manual, shark_gene) -> None:
         + "  ".join(f"{n}:{s['shark_' + n]:.1f}" for n in SHARK_GENE_NAMES)
     )
     status_line = (
-        f"fps:{clock.get_fps():3.0f}  shark:{mode}  edges:{edges}   "
-        f"shark=[{shark_gene}]   "
-        f"[M]shark [K]sharkcol [O]walls [B]rescue [R]reset [W]edges [Space]pause"
+        f"tps:{cfg.tps}  fps:{clock.get_fps():3.0f}/{cfg.fps}  "
+        f"shark:{mode}  edges:{edges}   shark=[{shark_gene}]   "
+        f"[T]tps [F]fps [M]shark [K]sharkcol [O]walls [B]rescue [R]reset "
+        f"[W]edges [Space]pause"
     )
 
     for i, text in enumerate((fish_line, shark_line, status_line)):
