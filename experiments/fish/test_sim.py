@@ -786,6 +786,82 @@ def test_walls_no_spurious_far_push():
     assert not push.any() and not eject.any()
 
 
+# --- Fish respawn as clone-splits ---------------------------------------------
+
+
+def test_respawned_fish_split_off_existing_fish():
+    cfg = Config(
+        num_fish=60, num_sharks=0, wrap_edges=True, width=1000, height=800,
+        fish_respawn_rate=10.0,
+    )
+    sim = Simulation(cfg, seed=7)
+    sim.fish.compact(np.arange(60) < 40)  # 20 eaten; 40 parents >= clone_min_pop
+    old_pos = sim.fish.pos.copy()
+    sim._fish_respawn()
+    assert len(sim.fish) == 50  # 10 owed this tick
+    newborn = sim.fish.pos[40:]
+    from neighbors import min_image as mi
+
+    delta = mi(newborn[:, None, :] - old_pos[None, :, :], sim.world)
+    nearest = np.sqrt(np.einsum("npc,npc->np", delta, delta)).min(axis=1)
+    assert np.all(nearest <= cfg.fish_clone_radius + 1e-9)
+    assert np.all(newborn >= 0.0) and np.all(newborn < sim.world)
+
+
+def test_clones_wrap_when_parents_hug_an_edge():
+    cfg = Config(
+        num_fish=40, num_sharks=0, wrap_edges=True, width=500, height=400,
+        fish_respawn_rate=5.0, fish_clone_min_pop=10,
+    )
+    sim = Simulation(cfg, seed=8)
+    sim.fish.compact(np.arange(40) < 30)
+    sim.fish.pos[:] = (1.0, 1.0)  # the whole school in the wrap corner
+    sim._fish_respawn()
+    assert np.all(sim.fish.pos >= 0.0) and np.all(sim.fish.pos < sim.world)
+
+
+def test_clones_clamp_in_bounce_mode():
+    cfg = Config(
+        num_fish=40, num_sharks=0, wrap_edges=False, width=500, height=400,
+        fish_respawn_rate=5.0, fish_clone_min_pop=10,
+    )
+    sim = Simulation(cfg, seed=8)
+    sim.fish.compact(np.arange(40) < 30)
+    sim.fish.pos[:] = (499.5, 399.5)
+    sim._fish_respawn()
+    assert np.all(sim.fish.pos >= 0.0) and np.all(sim.fish.pos <= sim.world)
+
+
+def test_tiny_school_respawns_by_scatter_not_cloning():
+    cfg = Config(
+        num_fish=20, num_sharks=0, wrap_edges=True, width=1200, height=900,
+        fish_respawn_rate=10.0,
+    )
+    sim = Simulation(cfg, seed=9)
+    sim.fish.compact(np.arange(20) < 2)  # 2 survivors, well under clone_min_pop
+    parents = sim.fish.pos.copy()
+    sim._fish_respawn()
+    newborn = sim.fish.pos[2:]
+    assert len(newborn) == 10
+    delta = newborn[:, None, :] - parents[None, :, :]
+    nearest = np.sqrt(np.einsum("npc,npc->np", delta, delta)).min(axis=1)
+    # Uniform scatter over a 1200x900 sea: newcomers land far from the two
+    # survivors, which cloning could never do.
+    assert nearest.max() > cfg.fish_clone_radius
+
+
+def test_more_newcomers_than_parents_scatters_the_excess():
+    cfg = Config(
+        num_fish=80, num_sharks=0, wrap_edges=True, width=800, height=600,
+        fish_respawn_rate=40.0, fish_clone_min_pop=10,
+    )
+    sim = Simulation(cfg, seed=10)
+    sim.fish.compact(np.arange(80) < 30)  # 30 parents, 40 owed this tick
+    sim._fish_respawn()
+    assert len(sim.fish) == 70  # all 40 spawned: 30 clones + 10 scattered
+    assert np.all(sim.fish.pos >= 0.0) and np.all(sim.fish.pos < sim.world)
+
+
 # --- Render interpolation (fixed timestep: tps decoupled from fps) -----------
 
 

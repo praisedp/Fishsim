@@ -11,8 +11,9 @@ Each tick:
 - **Fish** are classic boids — identical, rule-based, non-evolving: the three
   Reynolds rules plus flee-from-the-nearest-shark, all weighted by shared
   config knobs. Eaten fish are gone; replacements trickle in at a steady
-  configurable rate (up to ``num_fish``), so the sea slowly refills after a
-  feeding frenzy.
+  configurable rate (up to ``num_fish``), each splitting off a surviving fish
+  (random scatter when the school is nearly wiped out), so the sea slowly
+  refills after a feeding frenzy.
 
 Only the sharks evolve. They have no population floor: if they can't catch
 enough they go extinct (the hall-of-fame rescue rebreeds them); if they're too
@@ -59,6 +60,7 @@ from walls import WallField, avoid_all
 
 # Behaviour constants (fixed by design, not evolved or config-tuned).
 SHARK_SPAWN_JITTER = 10.0  # newborn shark's offset from its parent
+FISH_SPLIT_TURN = 0.5  # max heading jitter (radians) of a cloned fish vs its parent
 
 
 def interp_positions(
@@ -608,9 +610,16 @@ class Simulation:
     def _fish_respawn(self) -> None:
         """Trickle the sea back up to ``num_fish`` after predation.
 
-        Fish don't breed — eaten ones are simply replaced at a steady
-        ``fish_respawn_rate`` per tick (fractional rates accumulate as debt),
-        each appearing at a random spot with a random heading."""
+        Fish don't breed — eaten ones are replaced at a steady
+        ``fish_respawn_rate`` per tick (fractional rates accumulate as debt).
+        Each replacement "splits off" a random surviving fish: it appears
+        within ``fish_clone_radius`` of its parent, swimming roughly the
+        parent's way, so births read as cloning instead of fish popping up in
+        empty water. Parents are drawn without replacement (one split per fish
+        per tick), and when the school is small (< ``fish_clone_min_pop``) —
+        or there are more newcomers than parents — the rest scatter at random
+        spots like the initial seeding, so a handful of survivors never looks
+        like it's fountaining clones."""
         cfg = self.cfg
         headroom = cfg.num_fish - len(self.fish)
         if headroom <= 0:
@@ -620,9 +629,36 @@ class Simulation:
         if k <= 0:
             return
         self._respawn_debt -= k
+        n = len(self.fish)
+        clones = min(k, n) if n >= cfg.fish_clone_min_pop else 0
+        pos_parts, vel_parts = [], []
+        if clones:
+            parents = self.rng.choice(n, clones, replace=False)
+            angle = self.rng.uniform(0, 2 * np.pi, clones)
+            dist = self.rng.uniform(2.0, cfg.fish_clone_radius, clones)
+            pos = self.fish.pos[parents] + (
+                np.stack([np.cos(angle), np.sin(angle)], axis=1) * dist[:, None]
+            )
+            if cfg.wrap_edges:
+                pos %= self.world
+            else:
+                pos = np.clip(pos, 0.0, self.world)
+            # The child swims on in roughly the parent's direction — a shared
+            # heading (not a random one) is what sells the "split" visually.
+            turn = self.rng.uniform(-FISH_SPLIT_TURN, FISH_SPLIT_TURN, clones)
+            c, s = np.cos(turn), np.sin(turn)
+            pvel = self.fish.vel[parents]
+            vel = np.stack(
+                [pvel[:, 0] * c - pvel[:, 1] * s, pvel[:, 0] * s + pvel[:, 1] * c],
+                axis=1,
+            )
+            pos_parts.append(pos)
+            vel_parts.append(vel)
+        if k - clones:
+            pos_parts.append(self.rng.uniform(0, self.world, (k - clones, 2)))
+            vel_parts.append(self._random_headings(k - clones))
         self.fish.append(
-            pos=self.rng.uniform(0, self.world, (k, 2)),
-            vel=self._random_headings(k),
+            pos=np.concatenate(pos_parts), vel=np.concatenate(vel_parts)
         )
         self.births += k
 

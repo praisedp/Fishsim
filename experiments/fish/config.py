@@ -38,6 +38,8 @@ class Config:
     fish_w_coh: float = 0.9  # cohesion weight (move toward group)
     fish_w_flee: float = 1.0  # flee-from-shark weight
     fish_respawn_rate: float = 0.5  # new fish per tick (fractional), up to num_fish
+    fish_clone_radius: float = 20.0  # a "born" fish appears within this of its parent
+    fish_clone_min_pop: int = 25  # below this many fish, respawns scatter randomly
 
     # --- Shark genetic algorithm (energy / hunger driven) ---
     max_sharks: int = 50  # hard cap on living sharks (no floor: they can go extinct)
