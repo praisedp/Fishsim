@@ -43,7 +43,7 @@ OCEAN = (12, 28, 54)
 HUD = (180, 200, 220)
 WALL = (110, 118, 126)  # muted stony grey
 WALL_EDGE = (70, 76, 82)  # darker facet outline
-HUE_BLUE = 210.0  # base hue of both palettes (blue)
+HUE_BLUE = 210.0  # base hue of the shark palette (blue); fish use cfg.fish_colors
 
 # Body geometry, in pixels along/across the heading.
 FISH_NOSE = 7.0
@@ -59,10 +59,6 @@ SHARK_BACK_SHADE = 0.25  # darker back triangle for depth
 HUD_X = 10
 HUD_Y = 10
 HUD_LINE_H = 18
-
-# Every fish is identical (rule-based boids, no genes), so one calm blue.
-FISH_COLOR = pygame.Color(0)
-FISH_COLOR.hsva = (HUE_BLUE, 85, 100, 100)
 
 
 def shark_color(fraction: float, energy_frac: float) -> pygame.Color:
@@ -107,8 +103,9 @@ def draw_fish_all(surface: pygame.Surface, sim: Simulation, pos: np.ndarray) -> 
     tips = (pos + heading * FISH_NOSE).tolist()
     lefts = (pos - heading * FISH_TAIL + side * FISH_HALF_W).tolist()
     rights = (pos - heading * FISH_TAIL - side * FISH_HALF_W).tolist()
-    for tip, left, right in zip(tips, lefts, rights):
-        pygame.draw.polygon(surface, FISH_COLOR, (tip, left, right))
+    colors = fish.color.tolist()  # per-fish palette variation, set at spawn
+    for tip, left, right, color in zip(tips, lefts, rights, colors):
+        pygame.draw.polygon(surface, color, (tip, left, right))
 
 
 def draw_sharks(

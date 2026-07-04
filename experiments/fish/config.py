@@ -40,6 +40,12 @@ class Config:
     fish_respawn_rate: float = 0.5  # new fish per tick (fractional), up to num_fish
     fish_clone_radius: float = 20.0  # a "born" fish appears within this of its parent
     fish_clone_min_pop: int = 25  # below this many fish, respawns scatter randomly
+    fish_colors: tuple[tuple[int, int, int], ...] = (
+        (255, 120, 90),  # coral
+        (80, 210, 190),  # turquoise
+    )  # base palette (RGB); each fish spawns as a variation of one of these
+    fish_color_variation: float = 1.0  # spread around the base colours
+    # (0 = exact palette colours, 1 = subtle family variety, >1 = wilder)
 
     # --- Shark genetic algorithm (energy / hunger driven) ---
     max_sharks: int = 50  # hard cap on living sharks (no floor: they can go extinct)

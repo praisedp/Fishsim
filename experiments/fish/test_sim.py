@@ -733,7 +733,8 @@ def test_state_compact_and_append():
     fish = FishState(capacity=5)
     pos = rng.uniform(0, 100, (4, 2))
     vel = np.tile(np.arange(4, dtype=float)[:, None], (1, 2))
-    fish.append(pos=pos, vel=vel)
+    color = rng.integers(0, 256, (4, 3), dtype=np.uint8)
+    fish.append(pos=pos, vel=vel, color=color)
     assert len(fish) == 4
 
     removed = fish.compact(np.array([True, False, True, False]))
@@ -746,7 +747,11 @@ def test_state_compact_and_append():
     assert np.allclose(fish.pos, pos[[0, 2]] + 1.0)
 
     # Appending past capacity trips the guard assert.
-    row = dict(pos=np.zeros((4, 2)), vel=np.zeros((4, 2)))
+    row = dict(
+        pos=np.zeros((4, 2)),
+        vel=np.zeros((4, 2)),
+        color=np.zeros((4, 3), dtype=np.uint8),
+    )
     try:
         fish.append(**row)
         assert False, "expected the capacity assert to fire"
@@ -860,6 +865,74 @@ def test_more_newcomers_than_parents_scatters_the_excess():
     sim._fish_respawn()
     assert len(sim.fish) == 70  # all 40 spawned: 30 clones + 10 scattered
     assert np.all(sim.fish.pos >= 0.0) and np.all(sim.fish.pos < sim.world)
+
+
+# --- Per-fish colours -----------------------------------------------------------
+
+
+def test_zero_variation_spawns_exact_palette_colors():
+    palette = ((255, 120, 90), (80, 210, 190))
+    cfg = Config(
+        num_fish=50, num_sharks=0, fish_colors=palette, fish_color_variation=0.0
+    )
+    sim = Simulation(cfg, seed=11)
+    assert sim.fish.color.dtype == np.uint8
+    matches = (sim.fish.color[:, None, :] == np.array(palette)[None]).all(axis=2)
+    assert matches.any(axis=1).all()  # every fish exactly one of the two bases
+    assert matches.any(axis=0).all()  # and both bases actually appear (50 draws)
+
+
+def test_default_variation_stays_near_a_palette_color():
+    palette = ((255, 120, 90), (80, 210, 190))
+    cfg = Config(num_fish=200, num_sharks=0, fish_colors=palette)
+    sim = Simulation(cfg, seed=12)
+    diff = sim.fish.color[:, None, :].astype(float) - np.array(palette)[None]
+    nearest = np.sqrt((diff**2).sum(axis=2)).min(axis=1)
+    assert nearest.max() < 120.0  # in-family variation, not arbitrary colours
+    assert nearest.mean() > 1.0  # ...but genuinely varied, not all exact
+
+
+def test_clones_inherit_parent_color_exactly_at_zero_variation():
+    cfg = Config(
+        num_fish=60, num_sharks=0, wrap_edges=True, width=800, height=600,
+        fish_respawn_rate=10.0, fish_color_variation=0.0,
+    )
+    sim = Simulation(cfg, seed=13)
+    sim.fish.compact(np.arange(60) < 40)
+    # Paint every parent a distinct colour so inheritance is unambiguous.
+    sim.fish.color[:] = np.stack(
+        [np.arange(40), np.arange(40) + 60, np.arange(40) + 120], axis=1
+    ).astype(np.uint8)
+    parent_colors = {tuple(c) for c in sim.fish.color.tolist()}
+    sim._fish_respawn()  # 10 owed, 40 parents -> all clones, no scatter
+    for c in sim.fish.color[40:].tolist():
+        assert tuple(c) in parent_colors
+
+
+def test_clone_color_drifts_slightly_to_regenerate_variety():
+    cfg = Config(
+        num_fish=60, num_sharks=0, wrap_edges=True, width=800, height=600,
+        fish_respawn_rate=10.0,  # default variation: clones drift a touch
+    )
+    sim = Simulation(cfg, seed=13)
+    sim.fish.compact(np.arange(60) < 40)
+    sim.fish.color[:] = (100, 150, 200)  # a colour-fixated school
+    sim._fish_respawn()
+    newborn = sim.fish.color[40:].astype(float)
+    dist = np.sqrt(((newborn - (100.0, 150.0, 200.0)) ** 2).sum(axis=1))
+    assert dist.max() <= 60.0  # still clearly the parent's colour...
+    assert dist.max() > 0.0  # ...but variety is regenerated, not frozen
+
+
+def test_color_survives_compaction_row_paired():
+    cfg = Config(num_fish=0, num_sharks=0, fish_respawn_rate=0.0)
+    sim = Simulation(cfg, seed=14)
+    sim.add_fish((100.0, 100.0), vel=(0.0, 0.0))  # eaten
+    sim.add_fish((400.0, 300.0), vel=(1.0, 0.0), color=(12, 34, 56))  # survives
+    sim.add_shark((100.0, 100.0), energy=50.0)
+    sim.step()
+    assert len(sim.fish) == 1
+    assert tuple(sim.fish.color[0].tolist()) == (12, 34, 56)
 
 
 # --- Render interpolation (fixed timestep: tps decoupled from fps) -----------

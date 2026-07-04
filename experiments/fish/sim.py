@@ -30,6 +30,8 @@ unit-tested headlessly.
 
 from __future__ import annotations
 
+import colorsys
+
 import numpy as np
 
 from brain import (
@@ -61,6 +63,10 @@ from walls import WallField, avoid_all
 # Behaviour constants (fixed by design, not evolved or config-tuned).
 SHARK_SPAWN_JITTER = 10.0  # newborn shark's offset from its parent
 FISH_SPLIT_TURN = 0.5  # max heading jitter (radians) of a cloned fish vs its parent
+FISH_SPLIT_COLOR_DRIFT = 0.3  # colour jitter of a clone vs its parent, as a
+# fraction of the spawn-time spread. Without it, clone inheritance plus
+# predation is selection with no mutation: colour variety can only ever be
+# destroyed, and the school drifts to a single fixed colour over time.
 
 
 def interp_positions(
@@ -172,6 +178,7 @@ class Simulation:
         self.fish.append(
             pos=self.rng.uniform(0, self.world, (n, 2)),
             vel=self._random_headings(n),
+            color=self._fish_colors(n),
         )
 
         s = cfg.num_sharks
@@ -194,6 +201,34 @@ class Simulation:
         starts blind to the past ("saw nothing before")."""
         return np.zeros((k, self.cfg.shark_memory_frames, N_SENSES))
 
+    def _jitter_colors(self, rgb: np.ndarray, scale: float) -> np.ndarray:
+        """``(k, 3)`` uint8 RGB: each row of ``rgb`` nudged by ``scale`` × the
+        standard spread.
+
+        The jitter is done in HSV — a whisker of hue, more saturation and
+        brightness — so every fish stays recognizably in its colour family
+        instead of drifting muddy the way raw RGB noise would.
+        """
+        base = np.asarray(rgb, dtype=float) / 255.0
+        k = len(base)
+        jitter = self.rng.uniform(-1.0, 1.0, (k, 3)) * np.array([0.02, 0.18, 0.18]) * scale
+        out = np.empty((k, 3))
+        for i in range(k):
+            h, s, v = colorsys.rgb_to_hsv(*base[i])
+            h = (h + jitter[i, 0]) % 1.0
+            s = min(1.0, max(0.0, s + jitter[i, 1]))
+            v = min(1.0, max(0.0, v + jitter[i, 2]))
+            out[i] = colorsys.hsv_to_rgb(h, s, v)
+        return (out * 255.0).round().astype(np.uint8)
+
+    def _fish_colors(self, k: int) -> np.ndarray:
+        """``(k, 3)`` uint8 RGB: each fish a variation of a random palette colour.
+        ``fish_color_variation`` scales the spread; 0 = exact palette colours."""
+        cfg = self.cfg
+        palette = np.asarray(cfg.fish_colors, dtype=float)
+        idx = self.rng.integers(0, len(palette), k)
+        return self._jitter_colors(palette[idx], cfg.fish_color_variation)
+
     def _random_headings(self, k: int) -> np.ndarray:
         """``(k, 2)`` fish velocities: random directions, speeds between the
         drift floor and the shared top speed."""
@@ -209,14 +244,19 @@ class Simulation:
         speed = np.minimum(genes[:, S_MINSPD], genes[:, S_MAXSPD])
         return np.stack([np.cos(angle), np.sin(angle)], axis=1) * speed[:, None]
 
-    def add_fish(self, pos, vel=None) -> None:
+    def add_fish(self, pos, vel=None, color=None) -> None:
         """Insert a single fish — mainly for tests."""
         vel = (
             self._random_headings(1)
             if vel is None
             else np.asarray(vel, dtype=float)[None]
         )
-        self.fish.append(pos=np.asarray(pos, dtype=float)[None], vel=vel)
+        color = (
+            self._fish_colors(1)
+            if color is None
+            else np.asarray(color, dtype=np.uint8)[None]
+        )
+        self.fish.append(pos=np.asarray(pos, dtype=float)[None], vel=vel, color=color)
 
     def add_shark(self, pos, genes=None, energy: float | None = None, weights=None) -> None:
         """Insert a single shark (mid-range genes, random brain by default) —
@@ -631,7 +671,7 @@ class Simulation:
         self._respawn_debt -= k
         n = len(self.fish)
         clones = min(k, n) if n >= cfg.fish_clone_min_pop else 0
-        pos_parts, vel_parts = [], []
+        pos_parts, vel_parts, color_parts = [], [], []
         if clones:
             parents = self.rng.choice(n, clones, replace=False)
             angle = self.rng.uniform(0, 2 * np.pi, clones)
@@ -654,11 +694,23 @@ class Simulation:
             )
             pos_parts.append(pos)
             vel_parts.append(vel)
+            # A split inherits the parent's colour, drifted a touch: twins look
+            # near-identical at birth, but variety keeps regenerating instead
+            # of only being eaten away (which would fixate one colour).
+            color_parts.append(
+                self._jitter_colors(
+                    self.fish.color[parents],
+                    cfg.fish_color_variation * FISH_SPLIT_COLOR_DRIFT,
+                )
+            )
         if k - clones:
             pos_parts.append(self.rng.uniform(0, self.world, (k - clones, 2)))
             vel_parts.append(self._random_headings(k - clones))
+            color_parts.append(self._fish_colors(k - clones))
         self.fish.append(
-            pos=np.concatenate(pos_parts), vel=np.concatenate(vel_parts)
+            pos=np.concatenate(pos_parts),
+            vel=np.concatenate(vel_parts),
+            color=np.concatenate(color_parts),
         )
         self.births += k
 

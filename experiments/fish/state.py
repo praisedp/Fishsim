@@ -72,14 +72,15 @@ class _SoABase:
 
 
 class FishState(_SoABase):
-    """The fish population: pure motion — rule-based boids carry no genes or
-    breeding bookkeeping."""
+    """The fish population: motion plus a cosmetic per-fish colour — rule-based
+    boids carry no genes or breeding bookkeeping."""
 
     def __init__(self, capacity: int):
         super().__init__(capacity, {
             "pos": ((2,), np.float64),
             "prev_pos": ((2,), np.float64),
             "vel": ((2,), np.float64),
+            "color": ((3,), np.uint8),  # cosmetic RGB, assigned at spawn
         })
 
     @property
@@ -93,6 +94,10 @@ class FishState(_SoABase):
     @property
     def vel(self) -> np.ndarray:
         return self._view("vel")
+
+    @property
+    def color(self) -> np.ndarray:
+        return self._view("color")
 
 
 class SharkState(_SoABase):
