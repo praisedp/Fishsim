@@ -791,6 +791,151 @@ def test_walls_no_spurious_far_push():
     assert not push.any() and not eject.any()
 
 
+# --- Terminal console -----------------------------------------------------------
+
+
+class _ConsoleWorld:
+    """Minimal stand-in for main.LoopWorld — same adapter protocol."""
+
+    def __init__(self, cfg: Config, seed: int = 0):
+        self.cfg = cfg
+        self.sim = Simulation(cfg, seed=seed)
+        self.paused = False
+        self.manual = False
+        self.gene = cfg.shark_color_gene
+        self.quit_called = False
+
+    def set_gene(self, name):
+        self.gene = name
+
+    def reset(self):
+        self.sim = Simulation(self.cfg)
+
+    def quit(self):
+        self.quit_called = True
+
+
+def _console_env(cfg: Config, seed: int = 0):
+    """A world plus a console capturing its rich output as plain text."""
+    import io
+
+    import console
+    from rich.console import Console as RichConsole
+
+    buf = io.StringIO()
+    console.out = RichConsole(file=buf, force_terminal=False, width=300)
+    return console, _ConsoleWorld(cfg, seed=seed), buf
+
+
+def test_console_registry_matches_config_fields():
+    import console
+
+    cfg = Config()
+    kind_types = {
+        "int": int, "float": (int, float), "bool": bool,
+        "choice": str, "colors": tuple, "ints": tuple,
+    }
+    for name, param in console.PARAMS.items():
+        assert hasattr(cfg, name), f"PARAMS key {name!r} is not a Config field"
+        default = getattr(cfg, name)
+        expected = kind_types[param.kind]
+        # bool is an int subclass: require exact match for int params.
+        if param.kind == "int":
+            assert type(default) is int, f"{name} default should be int"
+        else:
+            assert isinstance(default, expected), f"{name} kind/type mismatch"
+    assert console.PARAMS["walls_enabled"].apply == "rebuild_walls"
+
+
+def test_console_set_parses_clamps_and_applies():
+    cfg = Config(num_fish=30, num_sharks=0)
+    console, world, buf = _console_env(cfg)
+    console.execute("/set fish_respawn_rate 999", world)
+    assert cfg.fish_respawn_rate == 50.0  # clamped to the registry cap
+    assert "clamped" in buf.getvalue()
+    console.execute("/set wrap_edges off", world)
+    assert cfg.wrap_edges is False
+    console.execute("/set fish_colors #ff0000,#00ff00", world)
+    assert cfg.fish_colors == ((255, 0, 0), (0, 255, 0))
+    console.execute("/set shark_color_gene perception", world)
+    assert cfg.shark_color_gene == "perception"
+    assert world.gene == "perception"  # sync_gene hook reached the loop
+    console.execute("/set walls_enabled on", world)
+    assert len(world.sim.walls.shards) == cfg.num_walls  # rebuild hook ran
+
+
+def test_console_unknown_names_suggest_and_do_not_mutate():
+    cfg = Config(num_fish=10, num_sharks=0)
+    console, world, buf = _console_env(cfg)
+    before = cfg.fish_respawn_rate
+    console.execute("/set fish_respawn_rte 9", world)
+    assert cfg.fish_respawn_rate == before
+    assert "did you mean" in buf.getvalue()
+    console.execute("/hlep", world)  # unknown command: must not raise
+    assert "unknown command" in buf.getvalue()
+    console.execute("no slash", world)
+    assert "start with /" in buf.getvalue()
+
+
+def test_console_needs_reset_params_are_stored_and_flagged():
+    cfg = Config(num_fish=10, num_sharks=2)
+    console, world, buf = _console_env(cfg)
+    console.execute("/set num_sharks 30", world)
+    assert cfg.num_sharks == 30
+    assert "takes effect on /reset" in buf.getvalue()
+
+
+def test_console_raising_num_fish_grows_the_buffer_live():
+    cfg = Config(num_fish=50, num_sharks=0, fish_respawn_rate=50.0)
+    console, world, _ = _console_env(cfg)
+    assert world.sim.fish.capacity == 50
+    console.execute("/set num_fish 200", world)
+    assert world.sim.fish.capacity >= 200
+    for _ in range(10):
+        world.sim._fish_respawn()
+    assert len(world.sim.fish) == 200  # refilled past the old buffer size
+
+
+def test_console_raising_max_sharks_grows_the_buffer_live():
+    cfg = Config(num_fish=10, num_sharks=5, max_sharks=20, shark_cull_count=0)
+    console, world, _ = _console_env(cfg)
+    console.execute("/set max_sharks 100", world)
+    assert world.sim.sharks.capacity >= 100
+    world.sim.rescue_sharks(80)
+    assert len(world.sim.sharks) == 85  # past the old 20-cap buffer
+
+
+def test_state_ensure_capacity_preserves_live_rows():
+    fish = FishState(capacity=4)
+    pos = np.arange(6, dtype=float).reshape(3, 2)
+    fish.append(pos=pos, vel=pos * 2, color=np.full((3, 3), 7, dtype=np.uint8))
+    fish.ensure_capacity(50)
+    assert fish.capacity == 50 and len(fish) == 3
+    assert np.array_equal(fish.pos, pos) and np.array_equal(fish.vel, pos * 2)
+    fish.ensure_capacity(10)  # never shrinks
+    assert fish.capacity == 50
+
+
+def test_console_actions_pause_resume_spawn_quit():
+    cfg = Config(num_fish=30, num_sharks=0)
+    console, world, buf = _console_env(cfg)
+    console.execute("/pause", world)
+    assert world.paused
+    console.execute("/resume", world)
+    assert not world.paused
+    console.execute("/spawn fish 10", world)
+    assert len(world.sim.fish) == 30  # already at cap: spawns 0, no negatives
+    world.sim.fish.compact(np.arange(30) < 20)
+    console.execute("/spawn fish 5", world)
+    assert len(world.sim.fish) == 25
+    console.execute("/spawn shark 3", world)
+    assert len(world.sim.sharks) == 3
+    console.execute("/stats", world)
+    console.execute("/help", world)
+    console.execute("/quit", world)
+    assert world.quit_called
+
+
 # --- Fish respawn as clone-splits ---------------------------------------------
 
 

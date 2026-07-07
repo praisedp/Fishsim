@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python experiments/main.py)",
+      "Bash(uv run *)"
+    ]
+  }
+}

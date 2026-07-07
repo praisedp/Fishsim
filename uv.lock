@@ -339,12 +339,14 @@ source = { virtual = "experiments/fish" }
 dependencies = [
     { name = "numpy" },
     { name = "pygame" },
+    { name = "rich" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = ">=2.5.0" },
     { name = "pygame", specifier = ">=2.6.0" },
+    { name = "rich", specifier = ">=13.0" },
 ]
 
 [[package]]

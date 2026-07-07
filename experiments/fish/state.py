@@ -56,6 +56,20 @@ class _SoABase:
             self._fields[name][self.n : self.n + k] = values
         self.n += k
 
+    def ensure_capacity(self, capacity: int) -> None:
+        """Grow the buffers to hold ``capacity`` rows (no-op if they already do).
+
+        Lets population caps be raised while the sim runs: the live prefix is
+        copied into fresh, larger buffers. Never shrinks — lowering a cap just
+        leaves the extra rows idle."""
+        if capacity <= self.capacity:
+            return
+        for name, buf in self._fields.items():
+            grown = np.zeros((capacity, *buf.shape[1:]), dtype=buf.dtype)
+            grown[: self.n] = buf[: self.n]
+            self._fields[name] = grown
+        self.capacity = capacity
+
     def compact(self, keep: np.ndarray) -> int:
         """Drop live rows where ``keep`` is False, preserving the order of the rest.
 

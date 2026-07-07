@@ -11,6 +11,10 @@ The window is resizable — the sea is always exactly the window, so dragging a
 border grows or shrinks the world live (wrap, bounce, spawning and walls all
 follow the new bounds).
 
+The launching terminal doubles as a command console: type /help there for
+commands like /set (browse and live-edit any config knob), /stats, /rescue,
+/spawn — see console.py.
+
 Controls:
   - M: toggle MANUAL shark — the mouse drives the nearest shark; others stay auto.
   - K: cycle which gene the SHARK colour maps to.
@@ -24,9 +28,13 @@ Controls:
 
 from __future__ import annotations
 
+import queue
+import sys
+
 import numpy as np
 import pygame
 
+import console
 from config import Config
 from genome import SHARK_GENE_NAMES, SHARK_SPEC, gene_fractions
 from sim import Simulation, interp_positions
@@ -136,6 +144,38 @@ def draw_sharks(
         pygame.draw.polygon(surface, shade, (tails[k], lefts[k], rights[k]))
 
 
+class LoopWorld:
+    """What console commands act on: the live sim plus the loop-owned flags.
+
+    The main loop reads its own state (pause, manual shark, gene, quit) from
+    here, so keyboard shortcuts and terminal commands drive the same switches.
+    """
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.sim = Simulation(cfg)
+        self.paused = False
+        self.manual = False
+        self.gene_idx = SHARK_GENE_NAMES.index(cfg.shark_color_gene)
+        self.running = True
+
+    def set_gene(self, name: str) -> None:
+        self.gene_idx = SHARK_GENE_NAMES.index(name)
+
+    def reset(self) -> None:
+        self.sim = Simulation(self.cfg)
+
+    def quit(self) -> None:
+        self.running = False
+
+
+def _next_step(value: int) -> int:
+    """The speed step after the one nearest ``value`` (T/F cycle from wherever
+    the console may have set the rate)."""
+    idx = min(range(len(SPEED_STEPS)), key=lambda i: abs(SPEED_STEPS[i] - value))
+    return SPEED_STEPS[(idx + 1) % len(SPEED_STEPS)]
+
+
 def main() -> None:
     cfg = Config()
     pygame.init()
@@ -144,63 +184,67 @@ def main() -> None:
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("monospace", 14)
 
-    sim = Simulation(cfg)
-    paused = False
-    manual = False
-    shark_gene_idx = SHARK_GENE_NAMES.index(cfg.shark_color_gene)
-    # Snap the configured rates onto the runtime-cycled steps.
-    tps_idx = min(range(len(SPEED_STEPS)), key=lambda i: abs(SPEED_STEPS[i] - cfg.tps))
-    fps_idx = min(range(len(SPEED_STEPS)), key=lambda i: abs(SPEED_STEPS[i] - cfg.fps))
-    cfg.tps, cfg.fps = SPEED_STEPS[tps_idx], SPEED_STEPS[fps_idx]
+    world = LoopWorld(cfg)
+    # Terminal console: a daemon thread feeds typed lines into this queue; the
+    # loop below executes them on the main thread (never racing sim.step).
+    # Skipped when stdin isn't a terminal (piped/headless runs).
+    commands: queue.Queue[str] = queue.Queue()
+    if sys.stdin is not None and sys.stdin.isatty():
+        console.start_reader(commands)
+        console.out.print("terminal console ready — type [bold]/help[/bold]")
     # Fixed-timestep clock: real time owed to the sim. The world always steps
     # in whole 1/tps ticks; rendering happens as often as fps allows, drawing
     # partway between ticks (alpha) so extra frames genuinely look smoother.
     accumulator = 0.0
-    running = True
 
-    while running:
+    while world.running:
         dt = clock.tick(cfg.fps) / 1000.0
+
+        try:
+            while True:
+                console.execute(commands.get_nowait(), world)
+        except queue.Empty:
+            pass
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                running = False
+                world.running = False
             elif event.type == pygame.VIDEORESIZE:
                 # The display surface already tracks the window; the sim world
                 # has to be told the new size.
                 screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
-                sim.resize(*screen.get_size())
+                world.sim.resize(*screen.get_size())
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    running = False
+                    world.running = False
                 elif event.key == pygame.K_SPACE:
-                    paused = not paused
+                    world.paused = not world.paused
                 elif event.key == pygame.K_w:
                     cfg.wrap_edges = not cfg.wrap_edges
                 elif event.key == pygame.K_m:
-                    manual = not manual
+                    world.manual = not world.manual
                 elif event.key == pygame.K_k:
-                    shark_gene_idx = (shark_gene_idx + 1) % len(SHARK_GENE_NAMES)
+                    world.gene_idx = (world.gene_idx + 1) % len(SHARK_GENE_NAMES)
                 elif event.key == pygame.K_o:
                     cfg.walls_enabled = not cfg.walls_enabled
-                    sim.rebuild_walls()  # (re)scatter or clear shards
+                    world.sim.rebuild_walls()  # (re)scatter or clear shards
                 elif event.key == pygame.K_b:
-                    sim.rescue_sharks(cfg.rescue_count)  # reseed best sharks
+                    world.sim.rescue_sharks(cfg.rescue_count)  # reseed best sharks
                 elif event.key == pygame.K_t:
-                    tps_idx = (tps_idx + 1) % len(SPEED_STEPS)
-                    cfg.tps = SPEED_STEPS[tps_idx]
+                    cfg.tps = _next_step(cfg.tps)
                 elif event.key == pygame.K_f:
-                    fps_idx = (fps_idx + 1) % len(SPEED_STEPS)
-                    cfg.fps = SPEED_STEPS[fps_idx]
+                    cfg.fps = _next_step(cfg.fps)
                 elif event.key == pygame.K_r:
-                    sim = Simulation(cfg)
+                    world.reset()
 
-        shark_gene = SHARK_GENE_NAMES[shark_gene_idx]
+        sim = world.sim
+        shark_gene = SHARK_GENE_NAMES[world.gene_idx]
 
         tick_dt = 1.0 / cfg.tps
-        if paused:
+        if world.paused:
             alpha = 1.0  # draw the settled state; time doesn't accrue
         else:
-            target = pygame.mouse.get_pos() if manual else None
+            target = pygame.mouse.get_pos() if world.manual else None
             accumulator = min(accumulator + dt, MAX_LAG_TICKS * tick_dt)
             while accumulator >= tick_dt:
                 sim.step(target)
@@ -221,7 +265,7 @@ def main() -> None:
         draw_fish_all(screen, sim, fish_pos)
         draw_sharks(screen, sim, shark_gene, shark_pos)
 
-        _draw_hud(screen, font, sim, cfg, clock, manual, shark_gene)
+        _draw_hud(screen, font, sim, cfg, clock, world.manual, shark_gene)
 
         pygame.display.flip()
 
@@ -248,7 +292,7 @@ def _draw_hud(screen, font, sim, cfg, clock, manual, shark_gene) -> None:
         f"tps:{cfg.tps}  fps:{clock.get_fps():3.0f}/{cfg.fps}  "
         f"shark:{mode}  edges:{edges}   shark=[{shark_gene}]   "
         f"[T]tps [F]fps [M]shark [K]sharkcol [O]walls [B]rescue [R]reset "
-        f"[W]edges [Space]pause"
+        f"[W]edges [Space]pause   /help in terminal"
     )
 
     for i, text in enumerate((fish_line, shark_line, status_line)):
